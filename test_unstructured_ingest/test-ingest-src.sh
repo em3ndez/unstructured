@@ -36,6 +36,7 @@ all_tests=(
   'slack.sh'
   'against-api.sh'
   'gcs.sh'
+  'kafka-local.sh'
   'onedrive.sh'
   'outlook.sh'
   'elasticsearch.sh'
@@ -93,7 +94,6 @@ python_version=$(python --version 2>&1)
 
 tests_to_ignore=(
   'notion.sh'
-  'dropbox.sh'
 )
 
 for test in "${all_tests[@]}"; do
