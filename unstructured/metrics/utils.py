@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import statistics
+from pathlib import Path
 from typing import List, Optional, Union
 
 import click
@@ -98,7 +99,7 @@ def _display(df):
 
 
 def _write_to_file(
-    dir: str, filename: str, df: pd.DataFrame, mode: str = "w", overwrite: bool = True
+    directory: str, filename: str, df: pd.DataFrame, mode: str = "w", overwrite: bool = True
 ):
     """
     Save the metrics report to tsv file. The function allows an option 1) to choose `mode`
@@ -106,15 +107,19 @@ def _write_to_file(
     """
     if mode not in ["w", "a"]:
         raise ValueError("Mode not supported. Mode must be one of [w, a].")
-    if dir and not os.path.exists(dir):
-        os.makedirs(dir)
+    if directory:
+        Path(directory).mkdir(exist_ok=True)
+    # Operate on a copy so callers can pass a view/slice without chained-assignment warnings.
+    df = df.copy()
     if "count" in df.columns:
         df["count"] = df["count"].astype(int)
     if "filename" in df.columns and "connector" in df.columns:
-        df.sort_values(by=["connector", "filename"], inplace=True)
+        df = df.sort_values(by=["connector", "filename"])
     if not overwrite:
-        filename = _get_non_duplicated_filename(dir, filename)
-    df.to_csv(os.path.join(dir, filename), sep="\t", mode=mode, index=False, header=(mode == "w"))
+        filename = _get_non_duplicated_filename(directory, filename)
+    df.to_csv(
+        os.path.join(directory, filename), sep="\t", mode=mode, index=False, header=(mode == "w")
+    )
 
 
 def _sorting_key(filename):
@@ -170,13 +175,16 @@ def _get_non_duplicated_filename(dir, filename) -> str:
     return filename
 
 
-def _mean(scores: Union[pd.Series, List[float]], rounding: Optional[int] = 3) -> Union[float, None]:
+def _mean(scores: List[Optional[float]], rounding: Optional[int] = 3) -> Union[float, None]:
     """
     Find mean from the list. Returns None if no element in the list.
 
     Args:
         rounding (int): optional argument that allows user to define decimal points. Default at 3.
     """
+    # Filter out None values, as `_stdev` and `_pstdev` do: an unmeasured score is
+    # not a score, and statistics.mean raises on it rather than ignoring it.
+    scores = [score for score in scores if score is not None]
     if len(scores) == 0:
         return None
     mean = statistics.mean(scores)
@@ -235,7 +243,7 @@ def _read_text_file(path):
         raise FileNotFoundError(f"The file at {path} does not exist.")
 
     try:
-        with open(path, errors="ignore") as f:
+        with open(path, encoding="utf-8", errors="ignore") as f:
             text = f.read()
         return text
     except OSError as e:

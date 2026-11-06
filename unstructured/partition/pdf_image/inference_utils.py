@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+import numpy as np
 from unstructured_inference.constants import Source
-from unstructured_inference.inference.elements import TextRegion
+from unstructured_inference.inference.elements import TextRegion, TextRegions
 from unstructured_inference.inference.layoutelement import (
     LayoutElement,
+    LayoutElements,
     partition_groups_from_regions,
 )
 
@@ -39,52 +41,53 @@ def build_layout_element(
 
 
 def build_layout_elements_from_ocr_regions(
-    ocr_regions: list[TextRegion],
+    ocr_regions: TextRegions,
     ocr_text: Optional[str] = None,
     group_by_ocr_text: bool = False,
-) -> list[LayoutElement]:
+) -> LayoutElements:
     """
     Get layout elements from OCR regions
     """
 
+    grouped_regions = []
     if group_by_ocr_text:
         text_sections = ocr_text.split("\n\n")
-        grouped_regions = []
+        mask = np.ones(ocr_regions.texts.shape).astype(bool)
+        indices = np.arange(len(mask))
         for text_section in text_sections:
             regions = []
             words = text_section.replace("\n", " ").split()
-            for ocr_region in ocr_regions:
+            for i, text in enumerate(ocr_regions.texts[mask]):
                 if not words:
                     break
-                if ocr_region.text in words:
-                    regions.append(ocr_region)
-                    words.remove(ocr_region.text)
+                if text in words:
+                    regions.append(indices[mask][i])
+                    words.remove(text)
 
             if not regions:
                 continue
 
-            for r in regions:
-                ocr_regions.remove(r)
-
-            grouped_regions.append(regions)
+            mask[regions] = False
+            grouped_regions.append(ocr_regions.slice(regions))
     else:
         grouped_regions = partition_groups_from_regions(ocr_regions)
 
-    merged_regions = [merge_text_regions(group) for group in grouped_regions]
-    return [
-        build_layout_element(
-            bbox=r.bbox, text=r.text, source=r.source, element_type=ElementType.UNCATEGORIZED_TEXT
-        )
-        for r in merged_regions
-    ]
+    merged_regions = TextRegions.from_list([merge_text_regions(group) for group in grouped_regions])
+    return LayoutElements(
+        element_coords=merged_regions.element_coords,
+        texts=merged_regions.texts,
+        sources=merged_regions.sources,
+        element_class_ids=np.zeros(merged_regions.texts.shape),
+        element_class_id_map={0: ElementType.UNCATEGORIZED_TEXT},
+    )
 
 
-def merge_text_regions(regions: list[TextRegion]) -> TextRegion:
+def merge_text_regions(regions: TextRegions) -> TextRegion:
     """
     Merge a list of TextRegion objects into a single TextRegion.
 
     Parameters:
-    - group (list[TextRegion]): A list of TextRegion objects to be merged.
+    - group (TextRegions): A group of TextRegion objects to be merged.
 
     Returns:
     - TextRegion: A single merged TextRegion object.
@@ -93,13 +96,13 @@ def merge_text_regions(regions: list[TextRegion]) -> TextRegion:
     if not regions:
         raise ValueError("The text regions to be merged must be provided.")
 
-    min_x1 = min([tr.bbox.x1 for tr in regions])
-    min_y1 = min([tr.bbox.y1 for tr in regions])
-    max_x2 = max([tr.bbox.x2 for tr in regions])
-    max_y2 = max([tr.bbox.y2 for tr in regions])
+    min_x1 = regions.x1.min().astype(float)
+    min_y1 = regions.y1.min().astype(float)
+    max_x2 = regions.x2.max().astype(float)
+    max_y2 = regions.y2.max().astype(float)
 
-    merged_text = " ".join([tr.text for tr in regions if tr.text])
-    sources = [tr.source for tr in regions]
-    source = sources[0] if all(s == sources[0] for s in sources) else None
+    merged_text = " ".join([text for text in regions.texts if text])
+    # assumption is the regions has the same source
+    source = regions.sources[0]
 
     return TextRegion.from_coords(min_x1, min_y1, max_x2, max_y2, merged_text, source)

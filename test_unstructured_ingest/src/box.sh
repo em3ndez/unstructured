@@ -38,19 +38,22 @@ if [ -z "$BOX_APP_CONFIG_PATH" ]; then
   echo "$BOX_APP_CONFIG" >"$BOX_APP_CONFIG_PATH"
 fi
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
+
+# shellcheck disable=SC2046
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   box \
   --download-dir "$DOWNLOAD_DIR" \
-  --box-app-config "$BOX_APP_CONFIG_PATH" \
+  --box-app-config $(cat "$BOX_APP_CONFIG_PATH") \
   --remote-url box://utic-test-ingest-fixtures \
-  --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_processed,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
-  --output-dir "$OUTPUT_DIR" \
+  --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_processed,metadata.data_source.filesize_bytes,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
   --num-processes "$max_processes" \
   --preserve-downloads \
   --recursive \
   --reprocess \
   --verbose \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

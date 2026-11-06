@@ -4,6 +4,55 @@ from rapidfuzz.distance import Levenshtein
 
 from unstructured.cleaners.core import clean_bullets, remove_sentence_punctuation
 
+_DOUBLE_QUOTE_CODEPOINTS = (
+    "\u0022",  # U+0022 Standard typewriter/programmer's quote
+    "\u201c",  # U+201C Left double quotation mark
+    "\u201d",  # U+201D Right double quotation mark
+    "\u201e",  # U+201E Double low-9 quotation mark
+    "\u201f",  # U+201F Double high-reversed-9 quotation mark
+    "\u00ab",  # U+00AB Left-pointing double angle quotation mark
+    "\u00bb",  # U+00BB Right-pointing double angle quotation mark
+    "\u275d",  # U+275D Heavy double turned comma quotation mark ornament
+    "\u275e",  # U+275E Heavy double comma quotation mark ornament
+    "\u2e42",  # U+2E42 Double low-reversed-9 quotation mark
+    "\U0001f676",  # U+1F676 SANS-SERIF HEAVY DOUBLE TURNED COMMA QUOTATION MARK ORNAMENT
+    "\U0001f677",  # U+1F677 SANS-SERIF HEAVY DOUBLE COMMA QUOTATION MARK ORNAMENT
+    "\U0001f678",  # U+1F678 SANS-SERIF HEAVY LOW DOUBLE COMMA QUOTATION MARK ORNAMENT
+    "\u2826",  # U+2826 Braille double closing quotation mark
+    "\u2834",  # U+2834 Braille double opening quotation mark
+    "\u301d",  # U+301D REVERSED DOUBLE PRIME QUOTATION MARK
+    "\u301e",  # U+301E DOUBLE PRIME QUOTATION MARK
+    "\u301f",  # U+301F LOW DOUBLE PRIME QUOTATION MARK
+    "\uff02",  # U+FF02 FULLWIDTH QUOTATION MARK
+)
+
+_SINGLE_QUOTE_CODEPOINTS = (
+    "\u0027",  # U+0027 Standard typewriter/programmer's quote
+    "\u2018",  # U+2018 Left single quotation mark
+    "\u2019",  # U+2019 Right single quotation mark
+    "\u201a",  # U+201A Single low-9 quotation mark
+    "\u201b",  # U+201B Single high-reversed-9 quotation mark
+    "\u2039",  # U+2039 Single left-pointing angle quotation mark
+    "\u203a",  # U+203A Single right-pointing angle quotation mark
+    "\u275b",  # U+275B Heavy single turned comma quotation mark ornament
+    "\u275c",  # U+275C Heavy single comma quotation mark ornament
+    "\u300c",  # U+300C Left corner bracket
+    "\u300d",  # U+300D Right corner bracket
+    "\u300e",  # U+300E Left white corner bracket
+    "\u300f",  # U+300F Right white corner bracket
+    "\ufe41",  # U+FE41 PRESENTATION FORM FOR VERTICAL LEFT CORNER BRACKET
+    "\ufe42",  # U+FE42 PRESENTATION FORM FOR VERTICAL RIGHT CORNER BRACKET
+    "\ufe43",  # U+FE43 PRESENTATION FORM FOR VERTICAL LEFT WHITE CORNER BRACKET
+    "\ufe44",  # U+FE44 PRESENTATION FORM FOR VERTICAL RIGHT WHITE CORNER BRACKET
+    "\uff07",  # U+FF07 FULLWIDTH APOSTROPHE
+    "\uff62",  # U+FF62 HALFWIDTH LEFT CORNER BRACKET
+    "\uff63",  # U+FF63 HALFWIDTH RIGHT CORNER BRACKET
+)
+
+_TRANSLATION_TABLE = str.maketrans(
+    dict.fromkeys(_DOUBLE_QUOTE_CODEPOINTS, '"') | dict.fromkeys(_SINGLE_QUOTE_CODEPOINTS, "'")
+)
+
 
 def calculate_accuracy(
     output: Optional[str],
@@ -22,6 +71,7 @@ def calculate_edit_distance(
     source: Optional[str],
     weights: Tuple[int, int, int] = (2, 1, 1),
     return_as: str = "distance",
+    standardize_whitespaces: bool = True,
 ) -> float:
     """
     Calculates edit distance using Levenshtein distance between two strings.
@@ -56,8 +106,8 @@ def calculate_edit_distance(
     return_types = ["score", "distance"]
     if return_as not in return_types:
         raise ValueError("Invalid return value type. Expected one of: %s" % return_types)
-    output = _prepare_str(output)
-    source = _prepare_str(source)
+    output = standardize_quotes(prepare_str(output, standardize_whitespaces))
+    source = standardize_quotes(prepare_str(source, standardize_whitespaces))
     distance = Levenshtein.distance(output, source, weights=weights)  # type: ignore
     # lower bounded the char length for source string at 1.0 because to avoid division by zero
     # in the case where source string is empty, the distance should be at 100%
@@ -127,8 +177,8 @@ def calculate_percent_missing_text(
 
     Returns the percentage of missing text represented as a decimal between 0 and 1.
     """
-    output = _prepare_str(output)
-    source = _prepare_str(source)
+    output = prepare_str(output)
+    source = prepare_str(source)
     output_bow = bag_of_words(output)
     source_bow = bag_of_words(source)
 
@@ -153,7 +203,22 @@ def calculate_percent_missing_text(
     return min(fraction_missing, 1)  # limit to 100%
 
 
-def _prepare_str(string: Optional[str]) -> str:
+def prepare_str(string: Optional[str], standardize_whitespaces: bool = False) -> str:
     if not string:
         return ""
+    if standardize_whitespaces:
+        return " ".join(string.split())
     return str(string)  # type: ignore
+
+
+def standardize_quotes(text: str) -> str:
+    """
+    Converts all unicode quotes to standard ASCII quotes with comprehensive coverage.
+
+    Args:
+        text (str): The input text to be standardized.
+
+    Returns:
+        str: The text with standardized quotes.
+    """
+    return text.translate(_TRANSLATION_TABLE)

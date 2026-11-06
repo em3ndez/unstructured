@@ -20,19 +20,25 @@ function cleanup() {
 }
 trap cleanup EXIT
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+if [ -z "$VOYAGE_API_KEY" ]; then
+  echo "Skipping local voyageai ingest test because the VOYAGE_API_KEY env var is not set."
+  exit 8
+fi
+
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   local \
   --num-processes "$max_processes" \
   --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_created,metadata.data_source.date_modified,metadata.data_source.date_processed,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --reprocess \
   --input-path example-docs/book-war-and-peace-1p.txt \
   --work-dir "$WORK_DIR" \
-  --embedding-provider "langchain-voyageai" \
+  --embedding-provider "voyageai" \
   --embedding-api-key "$VOYAGE_API_KEY" \
-  --embedding-model-name "voyage-large-2"
+  --embedding-model-name "voyage-3-large" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 set +e
 

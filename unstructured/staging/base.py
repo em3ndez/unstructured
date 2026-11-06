@@ -4,19 +4,29 @@ import base64
 import csv
 import io
 import json
+import re
+import tempfile
 import zlib
-from copy import deepcopy
+from copy import copy
 from datetime import datetime
-from typing import Any, Iterable, Optional, Sequence, cast
+from typing import Any, Iterable, Iterator, Optional, Sequence, cast
 
 from unstructured.documents.coordinates import PixelSpace
 from unstructured.documents.elements import (
     TYPE_TO_TEXT_ELEMENT_MAP,
     CheckBox,
+    CoordinatesMetadata,
     Element,
     ElementMetadata,
+    Formula,
+    Image,
+    Table,
+    TableChunk,
+    Title,
 )
-from unstructured.partition.common import exactly_one
+from unstructured.errors import DecompressedSizeExceededError
+from unstructured.file_utils.ndjson import dumps as ndjson_dumps
+from unstructured.partition.common.common import exactly_one
 from unstructured.utils import Point, dependency_exists, requires_dependencies
 
 if dependency_exists("pandas"):
@@ -31,6 +41,131 @@ if dependency_exists("pandas"):
 
 # == DESERIALIZERS ===============================
 
+MAX_DECOMPRESSED_SIZE = 200 * 1024 * 1024  # 200MB
+
+FORMULA_MARKDOWN_AUTO = "auto"
+FORMULA_MARKDOWN_DISPLAY_MATH = "display_math"
+FORMULA_MARKDOWN_PLAIN = "plain"
+_FORMULA_MARKDOWN_STYLES = frozenset(
+    {FORMULA_MARKDOWN_AUTO, FORMULA_MARKDOWN_DISPLAY_MATH, FORMULA_MARKDOWN_PLAIN},
+)
+
+# Long OCR-heavy captions often masquerade as Formula; require strong LaTeX-like signals to wrap.
+_FORMULA_PROSE_HINT = re.compile(
+    r"\b(was|were|using|calculated|where|respectively|determined|following)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_formula_for_markdown(text: str) -> str:
+    """Normalize common Unicode math glyphs to LaTeX-friendly tokens.
+
+    This is intentionally conservative and only handles symbols that are very likely to be
+    interpreted as math operators/relations. The Unicode square root sign (``√``) is not
+    rewritten: mapping it to ``\\sqrt{}`` would require reparsing the radicand and could
+    corrupt expressions like ``√2`` or ``√(x+1)``.
+    """
+    # Use `{}` after each LaTeX command so the next character cannot fuse into the name
+    # (e.g. x∈S -> x\in{}S, not x\inS).
+    substitutions = {
+        "−": "-",  # Unicode minus -> ASCII hyphen-minus
+        "×": r"\times{}",
+        "÷": r"\div{}",
+        "∞": r"\infty{}",
+        "∈": r"\in{}",
+        "∉": r"\notin{}",
+        "≤": r"\leq{}",
+        "≥": r"\geq{}",
+        "≈": r"\approx{}",
+        "≠": r"\neq{}",
+    }
+    normalized = text
+    for source, target in substitutions.items():
+        normalized = normalized.replace(source, target)
+    return normalized
+
+
+def _formula_has_unsafe_markdown_delimiters(text: str) -> bool:
+    """True if wrapping in ``$$`` could break Markdown structure or confuse math renderers."""
+    return "$" in text
+
+
+def _formula_math_signal_score(text: str) -> int:
+    """Rough score of how much the string looks like notation (not prose OCR)."""
+    score = 0
+    if re.search(r"\\[a-zA-Z]+", text):
+        score += 3
+    if "^" in text:
+        score += 1
+    if re.search(r"_(\{|[0-9A-Za-z])", text):
+        score += 1
+    rel_sym_count = len(re.findall(r"[∈∉≤≥≠≈×÷∞∑∫√∂∇]", text))
+    score += min(rel_sym_count * 2, 6)
+    if re.search(r"[¼½¾]", text):
+        score += 1
+    equals_like = len(
+        re.findall(
+            r"(?<=[A-Za-z0-9\)\]])\s*=\s*(?=[A-Za-z0-9\(\\])",
+            text,
+        ),
+    )
+    score += min(equals_like, 2)
+    # e.g. FFN(x) = max(...); require "(" to be function-like, not "(0) =" from OCR tables
+    if re.search(r"(?<=[A-Za-z])\([^)]*\)\s*=\s*", text):
+        score += 2
+    return score
+
+
+def _formula_looks_like_prose_sentence(text: str) -> bool:
+    return len(text) >= 80 and _FORMULA_PROSE_HINT.search(text) is not None
+
+
+def _formula_auto_use_display_math(text: str) -> bool:
+    if _formula_looks_like_prose_sentence(text):
+        return _formula_math_signal_score(text) >= 3
+    return _formula_math_signal_score(text) >= 2
+
+
+def _emit_formula_markdown(
+    raw_text: str,
+    *,
+    normalize_formula: bool,
+    formula_markdown_style: str,
+) -> str:
+    """Serialize Formula text for Markdown.
+
+    Heuristic scoring for ``auto`` runs on **raw** stripped text so Unicode symbols
+    are not replaced by ``\\command`` before the score is computed. Normalization
+    applies only to text emitted inside ``$$`` blocks. ``plain`` never normalizes.
+    """
+    raw = raw_text.strip()
+    if not raw:
+        return raw
+
+    style = formula_markdown_style.strip().lower()
+    if style not in _FORMULA_MARKDOWN_STYLES:
+        raise ValueError(
+            "formula_markdown_style must be one of "
+            f"{sorted(_FORMULA_MARKDOWN_STYLES)!r}, got {formula_markdown_style!r}",
+        )
+    if style == FORMULA_MARKDOWN_PLAIN:
+        return raw
+
+    if _formula_has_unsafe_markdown_delimiters(raw):
+        return raw
+
+    use_display_math = False
+    if style == FORMULA_MARKDOWN_DISPLAY_MATH:
+        use_display_math = True
+    elif style == FORMULA_MARKDOWN_AUTO:
+        use_display_math = _formula_auto_use_display_math(raw)
+
+    if not use_display_math:
+        return raw
+
+    body = _normalize_formula_for_markdown(raw) if normalize_formula else raw
+    return f"$$\n{body}\n$$"
+
 
 def elements_from_base64_gzipped_json(b64_encoded_elements: str) -> list[Element]:
     """Restore Base64-encoded gzipped JSON elements to element objects.
@@ -41,11 +176,25 @@ def elements_from_base64_gzipped_json(b64_encoded_elements: str) -> list[Element
     # -- Base64 str -> gzip-encoded (JSON) bytes --
     decoded_b64_bytes = base64.b64decode(b64_encoded_elements)
     # -- undo gzip compression --
-    elements_json_bytes = zlib.decompress(decoded_b64_bytes)
+    dobj = zlib.decompressobj()
+    elements_json_bytes = dobj.decompress(decoded_b64_bytes, max_length=MAX_DECOMPRESSED_SIZE)
+    # -- Check if decompression completed successfully --
+    if not dobj.eof:
+        # Check if we hit the size limit or if data is actually incomplete
+        if len(elements_json_bytes) >= MAX_DECOMPRESSED_SIZE:
+            raise DecompressedSizeExceededError(
+                max_size=MAX_DECOMPRESSED_SIZE,
+            )
+        else:
+            raise zlib.error("Incomplete or corrupted compressed data")
+    # -- release compressed input before allocating the decoded JSON string --
+    del decoded_b64_bytes, dobj
     # -- JSON (bytes) to JSON (str) --
     elements_json_str = elements_json_bytes.decode("utf-8")
+    del elements_json_bytes
     # -- JSON (str) -> dicts --
     element_dicts = json.loads(elements_json_str)
+    del elements_json_str
     # -- dicts -> elements --
     return elements_from_dicts(element_dicts)
 
@@ -65,6 +214,11 @@ def elements_from_dicts(element_dicts: Iterable[dict[str, Any]]) -> list[Element
         if item.get("type") in TYPE_TO_TEXT_ELEMENT_MAP:
             ElementCls = TYPE_TO_TEXT_ELEMENT_MAP[item["type"]]
             elements.append(ElementCls(text=item["text"], element_id=element_id, metadata=metadata))
+        elif item.get("type") == "TableChunk":
+            # -- not in TYPE_TO_TEXT_ELEMENT_MAP (the map also feeds the COCO category
+            # -- vocabulary); special-cased like CheckBox so serialized chunker output can
+            # -- rehydrate and feed `reconstruct_table_from_chunks()` (see PR #4291) --
+            elements.append(TableChunk(text=item["text"], element_id=element_id, metadata=metadata))
         elif item.get("type") == "CheckBox":
             elements.append(
                 CheckBox(checked=item["checked"], element_id=element_id, metadata=metadata)
@@ -103,19 +257,164 @@ def elements_to_base64_gzipped_json(elements: Iterable[Element]) -> str:
     possible when transported as JSON, for example in an HTTP response. This compressed form is also
     present when elements are in dict form ("element_dicts"). This function is not coupled to that
     purpose however and could have other uses.
+
+    Serialization avoids collection-wide graph and JSON staging and fragments individual large
+    strings. Individual elements, containers of short strings, sorted items, and the final Base64
+    join can still scale with their contents; this is not a hard fragment or process-memory bound.
+    Large incompressible output requires writable temporary storage for the compressed spool and
+    can raise an I/O error if that storage is unavailable.
     """
-    # -- adjust floating-point precision of coordinates down for a more compact str value --
-    precision_adjusted_elements = _fix_metadata_field_precision(elements)
-    # -- serialize elements as dicts --
-    element_dicts = elements_to_dicts(precision_adjusted_elements)
-    # -- serialize the dicts to JSON (bytes) --
-    json_bytes = json.dumps(element_dicts, sort_keys=True).encode("utf-8")
-    # -- compress the JSON bytes with gzip compression --
-    deflated_bytes = zlib.compress(json_bytes)
-    # -- base64-encode those bytes so they can be serialized as a JSON string value --
-    b64_deflated_bytes = base64.b64encode(deflated_bytes)
-    # -- convert to a string suitable for serializing in JSON --
-    return b64_deflated_bytes.decode("utf-8")
+    compressor = zlib.compressobj()
+    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as compressed:
+        compressed.write(compressor.compress(b"["))
+        for index, element in enumerate(elements):
+            if index:
+                compressed.write(compressor.compress(b", "))
+            # Keep precision adjustment and element serialization local to one element.
+            adjusted = _fix_metadata_field_precision((element,))[0]
+            for fragment in _iter_json_fragments(adjusted.to_dict()):
+                compressed.write(compressor.compress(fragment.encode("utf-8")))
+        compressed.write(compressor.compress(b"]"))
+        compressed.write(compressor.flush())
+        compressed.seek(0)
+        # Multiples of three avoid padding between base64 fragments. Encoded fragments and
+        # their final join grow with the collection; the compressed spool spills to disk.
+        return "".join(
+            base64.b64encode(block).decode("ascii")
+            for block in iter(lambda: compressed.read(65535), b"")
+        )
+
+
+_JSON_STRING_FRAGMENT_SIZE = 65536
+
+
+def _container_items(value: dict[Any, Any] | Sequence[Any]) -> Iterator[Any]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield item
+    else:
+        yield from value
+
+
+def _containers_with_large_strings(value: Any) -> set[int]:
+    """Ids of the containers in `value` that hold a string longer than one JSON fragment.
+
+    Each container is classified once, even when it is shared, so the work is linear in the size
+    of `value`. The walk uses an explicit stack, so nesting the standard encoder accepts never
+    exhausts the interpreter's recursion limit here. A container that appears inside itself raises
+    the standard encoder's circular-reference error.
+    """
+    if not isinstance(value, (dict, list, tuple)):
+        return set()
+    large: set[int] = set()
+    classified: set[int] = set()
+    active_containers = {id(value)}
+    stack = [(id(value), _container_items(cast("dict[Any, Any] | Sequence[Any]", value)))]
+    while stack:
+        container_id, items = stack[-1]
+        for item in items:
+            if isinstance(item, str):
+                if len(item) > _JSON_STRING_FRAGMENT_SIZE:
+                    large.add(container_id)
+            elif isinstance(item, (dict, list, tuple)):
+                item_id = id(item)
+                if item_id in active_containers:
+                    raise ValueError("Circular reference detected")
+                if item_id in classified:
+                    if item_id in large:
+                        large.add(container_id)
+                    continue
+                active_containers.add(item_id)
+                stack.append((item_id, _container_items(item)))
+                break
+        else:
+            stack.pop()
+            active_containers.remove(container_id)
+            classified.add(container_id)
+            if stack and container_id in large:
+                large.add(stack[-1][0])
+    return large
+
+
+class _Nested:
+    """A value whose JSON fragments are emitted in place of this marker."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any):
+        self.value = value
+
+
+def _iter_json_fragments(value: Any) -> Iterator[str]:
+    """Emit default, sorted-key JSON, fragmenting individual large strings.
+
+    Values without a large string are encoded in one call to the standard encoder, so arbitrary
+    containers can exceed the string fragment size. This does not bound total working memory.
+    Nested containers are walked with an explicit stack, so nesting depth is not limited by the
+    interpreter's recursion limit.
+    """
+    active_containers: set[int] = set()
+    large_containers = _containers_with_large_strings(value)
+    stack = [_json_parts(value, active_containers, large_containers)]
+    while stack:
+        part = next(stack[-1], None)
+        if part is None:
+            stack.pop()
+        elif isinstance(part, _Nested):
+            stack.append(_json_parts(part.value, active_containers, large_containers))
+        else:
+            yield part
+
+
+def _json_parts(
+    value: Any, active_containers: set[int], large_containers: set[int]
+) -> Iterator[str | _Nested]:
+    """JSON fragments of `value`, with nested values left as `_Nested` markers to expand."""
+    is_container = isinstance(value, (dict, list, tuple))
+    container_id = id(value)
+    if is_container:
+        if container_id in active_containers:
+            raise ValueError("Circular reference detected")
+        active_containers.add(container_id)
+    try:
+        has_large_string = (
+            len(value) > _JSON_STRING_FRAGMENT_SIZE
+            if isinstance(value, str)
+            else is_container and container_id in large_containers
+        )
+        if not has_large_string:
+            yield json.dumps(value, sort_keys=True)
+        elif isinstance(value, str):
+            yield '"'
+            for start in range(0, len(value), _JSON_STRING_FRAGMENT_SIZE):
+                yield json.dumps(value[start : start + _JSON_STRING_FRAGMENT_SIZE])[1:-1]
+            yield '"'
+        elif isinstance(value, (list, tuple)):
+            yield "["
+            for index, item in enumerate(value):
+                if index:
+                    yield ", "
+                yield _Nested(item)
+            yield "]"
+        else:
+            yield "{"
+            for index, (key, item) in enumerate(sorted(value.items())):
+                if index:
+                    yield ", "
+                if not isinstance(key, str):
+                    if isinstance(key, (int, float)) or key is None:
+                        key = json.dumps(key)
+                    else:
+                        # Preserve the standard encoder's rejection of unsupported keys.
+                        json.dumps({key: item}, sort_keys=True)
+                yield _Nested(key)
+                yield ": "
+                yield _Nested(item)
+            yield "}"
+    finally:
+        if is_container:
+            active_containers.discard(container_id)
 
 
 def elements_to_dicts(elements: Iterable[Element]) -> list[dict[str, Any]]:
@@ -128,15 +427,178 @@ convert_to_isd = elements_to_dicts
 convert_to_dict = elements_to_dicts
 
 
+def element_to_md(
+    element: Element,
+    exclude_binary_image_data: bool = False,
+    normalize_formula: bool = True,
+    *,
+    formula_markdown_style: str = FORMULA_MARKDOWN_AUTO,
+) -> str:
+    match element:
+        case Title(text=text):
+            return f"# {text}"
+        case Formula(text=text):
+            return _emit_formula_markdown(
+                text,
+                normalize_formula=normalize_formula,
+                formula_markdown_style=formula_markdown_style,
+            )
+        case Table(metadata=metadata, text=text) if metadata.text_as_html is not None:
+            return metadata.text_as_html
+        case Image(metadata=metadata, text=text) if (
+            metadata.image_base64 is not None
+            and metadata.image_mime_type is None
+            and not exclude_binary_image_data
+        ):
+            return f"![{text}](data:image/*;base64,{metadata.image_base64})"
+        case Image(metadata=metadata, text=text) if (
+            metadata.image_base64 is not None and not exclude_binary_image_data
+        ):
+            return f"![{text}](data:{metadata.image_mime_type};base64,{metadata.image_base64})"
+        case Image(metadata=metadata, text=text) if metadata.image_url is not None:
+            return f"![{text}]({metadata.image_url})"
+        case _:
+            return element.text
+
+
+def elements_to_md(
+    elements: Iterable[Element],
+    filename: Optional[str] = None,
+    exclude_binary_image_data: bool = False,
+    encoding: str = "utf-8",
+    normalize_formula: bool = True,
+    *,
+    formula_markdown_style: str = FORMULA_MARKDOWN_AUTO,
+) -> str:
+    """Convert elements to markdown format.
+
+    Args:
+        elements: Iterable of elements to convert
+        filename: Optional file path to write the markdown to
+        exclude_binary_image_data: If True, exclude base64 image data from output
+        encoding: File encoding when writing to file
+        normalize_formula: If True, map common Unicode math symbols to LaTeX-like tokens
+            for `Formula` elements before wrapping with `$$ ... $$`. Placed after ``encoding``
+            so legacy positional calls ``(..., filename, exclude_binary, encoding)`` remain valid.
+        formula_markdown_style: How to serialize ``Formula`` elements: ``"auto"`` (default)
+            uses display math only when content looks like notation and has no ``$`` delimiters;
+            ``"display_math"`` always uses ``$$`` when safe; ``"plain"`` emits text only.
+            Keyword-only so positional encoding arguments stay backward compatible.
+
+    Returns:
+        The markdown content as a string
+    """
+    markdown_content = "\n".join(
+        [
+            element_to_md(
+                el,
+                exclude_binary_image_data=exclude_binary_image_data,
+                normalize_formula=normalize_formula,
+                formula_markdown_style=formula_markdown_style,
+            )
+            for el in elements
+        ]
+    )
+
+    if filename is not None:
+        with open(filename, "w", encoding=encoding) as f:
+            f.write(markdown_content)
+
+    return markdown_content
+
+
+def create_file_from_elements(
+    elements: Iterable[Element],
+    output_format: str = "markdown",
+    filename: Optional[str] = None,
+    encoding: str = "utf-8",
+    exclude_binary_image_data: bool = False,
+    no_group_by_page: bool = True,
+    normalize_formula: bool = True,
+    *,
+    formula_markdown_style: str = FORMULA_MARKDOWN_AUTO,
+) -> str:
+    """Re-create a document file from a list of elements (reverse of partition).
+
+    Use this after partitioning a document, optionally modifying elements (e.g. replacing
+    Image elements with NarrativeText using alt text), then writing back to a file.
+
+    Supported formats: "markdown", "html", "text".
+
+    Args:
+        elements: Iterable of elements to convert (e.g. from partition_* or after editing).
+        output_format: Output format: "markdown", "html", or "text".
+        filename: Optional path to write the document to.
+        encoding: File encoding when writing to file (all formats).
+        exclude_binary_image_data: If True, omit base64 image data. Applies only to
+            **markdown** and **html**; ignored for text.
+        no_group_by_page: If True (default), include all elements in output. If False,
+            group **html** by page (elements without metadata.page_number are skipped).
+            Applies only to **html**; ignored for markdown and text. Placed before
+            ``normalize_formula`` so legacy positional calls through ``exclude_binary_image_data``
+            and ``no_group_by_page`` remain valid.
+        normalize_formula: If True, map common Unicode math symbols to LaTeX-like tokens
+            for `Formula` elements in **markdown** output. Ignored for html/text.
+        formula_markdown_style: Passed to ``elements_to_md`` for **markdown** only.
+            Keyword-only; see ``elements_to_md``.
+
+    Returns:
+        The document content as a string.
+
+    Example:
+        >>> from unstructured.partition.md import partition_md
+        >>> from unstructured.staging.base import create_file_from_elements
+        >>> elements = partition_md("README.md")
+        >>> # ... modify elements (e.g. replace Image with NarrativeText) ...
+        >>> create_file_from_elements(elements, output_format="markdown", filename="out.md")
+    """
+    format_lower = output_format.strip().lower()
+    if format_lower not in ("markdown", "html", "text"):
+        raise ValueError(
+            f"Unsupported format: {output_format!r}. Supported formats: 'markdown', 'html', 'text'."
+        )
+
+    if format_lower == "markdown":
+        content = elements_to_md(
+            elements,
+            filename=filename,
+            exclude_binary_image_data=exclude_binary_image_data,
+            normalize_formula=normalize_formula,
+            encoding=encoding,
+            formula_markdown_style=formula_markdown_style,
+        )
+        return content
+    elif format_lower == "html":
+        from unstructured.partition.html.convert import elements_to_html
+
+        content = elements_to_html(
+            list(elements),
+            exclude_binary_image_data=exclude_binary_image_data,
+            no_group_by_page=no_group_by_page,
+        )
+        if filename is not None:
+            with open(filename, "w", encoding=encoding) as f:
+                f.write(content)
+        return content
+    else:
+        # text: delegate write to elements_to_text when filename is set
+        content = convert_to_text(elements)
+        if filename is not None:
+            elements_to_text(elements, filename=filename, encoding=encoding)
+        return content
+
+
 def elements_to_json(
     elements: Iterable[Element],
     filename: Optional[str] = None,
     indent: int = 4,
     encoding: str = "utf-8",
-) -> Optional[str]:
-    """Saves a list of elements to a JSON file if filename is specified.
+) -> str:
+    """Serialize `elements` to a JSON array.
 
-    Otherwise, return the list of elements as a string.
+    Also writes the JSON to `filename` if it is provided, encoded using `encoding`.
+
+    The JSON is returned as a string.
     """
     # -- serialize `elements` as a JSON array (str) --
     precision_adjusted_elements = _fix_metadata_field_precision(elements)
@@ -146,25 +608,67 @@ def elements_to_json(
     if filename is not None:
         with open(filename, "w", encoding=encoding) as f:
             f.write(json_str)
-        return None
 
     return json_str
 
 
+def elements_to_ndjson(
+    elements: Iterable[Element],
+    filename: Optional[str] = None,
+    encoding: str = "utf-8",
+) -> str:
+    """Serialize `elements` to a JSON array.
+
+    Also writes the JSON to `filename` if it is provided, encoded using `encoding`.
+
+    The JSON is returned as a string.
+    """
+    # -- serialize `elements` as a JSON array (str) --
+    precision_adjusted_elements = _fix_metadata_field_precision(elements)
+    element_dicts = elements_to_dicts(precision_adjusted_elements)
+    ndjson_str = ndjson_dumps(element_dicts, sort_keys=True)
+
+    if filename is not None:
+        with open(filename, "w", encoding=encoding) as f:
+            f.write(ndjson_str)
+
+    return ndjson_str
+
+
 def _fix_metadata_field_precision(elements: Iterable[Element]) -> list[Element]:
+    """Round `coordinates` and `detection_class_prob` for serialization.
+
+    An element with neither field is returned as-is, the caller's own object. Any other element is
+    returned as a shallow copy with its own metadata copy; the caller's element is not modified.
+    """
     out_elements: list[Element] = []
     for element in elements:
-        el = deepcopy(element)
+        # -- the copy exists only so the two fields below can be rounded without touching the
+        # -- caller's element; most elements carry neither, and this runs over every element of
+        # -- every serialized document --
+        if not element.metadata.coordinates and not element.metadata.detection_class_prob:
+            out_elements.append(element)
+            continue
+
+        # -- mint the id on the caller's element first. `Element.id` caches on first access, so
+        # -- without this the copy below takes a fresh uuid with it and every call reports a
+        # -- different `element_id` for the same element --
+        _ = element.id
+        el = copy(element)
+        el.metadata = copy(element.metadata)
         if el.metadata.coordinates:
-            precision = 1 if isinstance(el.metadata.coordinates.system, PixelSpace) else 2
-            points = el.metadata.coordinates.points
+            coordinates = el.metadata.coordinates
+            precision = 1 if isinstance(coordinates.system, PixelSpace) else 2
+            points = coordinates.points
             assert points is not None
             rounded_points: list[Point] = []
             for point in points:
                 x, y = point
                 rounded_point = (round(x, precision), round(y, precision))
                 rounded_points.append(rounded_point)
-            el.metadata.coordinates.points = tuple(rounded_points)
+            el.metadata.coordinates = CoordinatesMetadata(
+                points=tuple(rounded_points), system=coordinates.system
+            )
 
         if el.metadata.detection_class_prob:
             el.metadata.detection_class_prob = round(el.metadata.detection_class_prob, 5)
@@ -271,13 +775,7 @@ def flatten_dict(
 
 
 def _get_table_fieldnames(rows: list[dict[str, Any]]):
-    table_fieldnames = list(TABLE_FIELDNAMES)
-    for row in rows:
-        metadata = row["metadata"]
-        for key in flatten_dict(metadata):
-            if key.startswith("regex_metadata") and key not in table_fieldnames:
-                table_fieldnames.append(key)
-    return table_fieldnames
+    return list(TABLE_FIELDNAMES)
 
 
 def convert_to_csv(elements: Iterable[Element]) -> str:
@@ -336,9 +834,9 @@ def get_default_pandas_dtypes() -> dict[str, Any]:
         "emphasized_text_contents": object,  # Optional[list[str]]
         "emphasized_text_tags": object,  # Optional[list[str]]
         "text_as_html": pd.StringDtype(),  # Optional[str]  # type: ignore
-        "regex_metadata": object,
         "max_characters": "Int64",  # Optional[int]
         "is_continuation": "boolean",  # Optional[bool]
+        "num_carried_over_header_rows": "Int64",  # Optional[int]
         "detection_class_prob": float,  # Optional[float],
         "sender": pd.StringDtype(),  # type: ignore
         "coordinates_points": object,
@@ -353,7 +851,6 @@ def get_default_pandas_dtypes() -> dict[str, Any]:
         "data_source_date_processed": pd.StringDtype(),  # Optional[str]  # type: ignore
         "data_source_permissions_data": object,
         "embeddings": object,
-        "regex_metadata_key": object,
     }
 
 

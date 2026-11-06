@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-from typing import IO, Any, Optional, Union
+from typing import IO, Any, Optional
 
 import markdown
-import requests
+from markdown.extensions import Extension
 
-from unstructured.chunking import add_chunking_strategy
-from unstructured.documents.elements import Element, process_metadata
-from unstructured.file_utils.filetype import FileType, add_metadata_with_filetype
-from unstructured.partition.common import (
-    exactly_one,
-    get_last_modified_date,
-    get_last_modified_date_from_file,
-)
+from unstructured.documents.elements import Element
+from unstructured.file_utils.encoding import read_txt_file
+from unstructured.file_utils.model import FileType
+from unstructured.partition.common.common import exactly_one
+from unstructured.partition.common.metadata import get_last_modified_date
 from unstructured.partition.html import partition_html
+from unstructured.safe_http import safe_get
+from unstructured.telemetry import partition_runtime_telemetry
 
 
-def optional_decode(contents: Union[str, bytes]) -> str:
+def optional_decode(contents: str | bytes) -> str:
     if isinstance(contents, bytes):
         return contents.decode("utf-8")
     return contents
@@ -24,23 +23,40 @@ def optional_decode(contents: Union[str, bytes]) -> str:
 
 DETECTION_ORIGIN: str = "md"
 
+_DEFAULT_MARKDOWN_EXTENSIONS: list[str] = ["tables", "fenced_code"]
 
-@process_metadata()
-@add_metadata_with_filetype(FileType.MD)
-@add_chunking_strategy
+
+def _validate_markdown_extensions(extensions: Any) -> list[Any]:
+    """Return ``extensions`` if it is a list of strings and/or ``Extension`` instances.
+
+    Python-Markdown accepts extension entry points as registered names (``str``) or configured
+    ``Extension`` instances; both are supported here. Any other shape raises ``ValueError``.
+    """
+    if not isinstance(extensions, list):
+        raise ValueError(
+            "'extensions' must be a list of extension names (str) and/or "
+            f"markdown.extensions.Extension instances, got {type(extensions).__name__!r}"
+        )
+    for item in extensions:
+        if not isinstance(item, (str, Extension)):
+            raise ValueError(
+                "Each entry in 'extensions' must be a str or markdown.extensions.Extension "
+                f"instance, got {type(item).__name__}: {item!r}"
+            )
+    return extensions
+
+
+@partition_runtime_telemetry("md")
 def partition_md(
-    filename: Optional[str] = None,
-    file: Optional[IO[bytes]] = None,
-    text: Optional[str] = None,
-    url: Optional[str] = None,
-    include_page_breaks: bool = False,
-    include_metadata: bool = True,
-    metadata_filename: Optional[str] = None,
-    metadata_last_modified: Optional[str] = None,
-    chunking_strategy: Optional[str] = None,
-    languages: Optional[list[str]] = ["auto"],
-    detect_language_per_element: bool = False,
-    date_from_file_object: bool = False,
+    filename: str | None = None,
+    file: IO[bytes] | None = None,
+    text: str | None = None,
+    url: str | None = None,
+    metadata_filename: str | None = None,
+    metadata_last_modified: str | None = None,
+    languages: Optional[list[str]] = None,
+    *,
+    encoding: str | None = None,
     **kwargs: Any,
 ) -> list[Element]:
     """Partitions a markdown file into its constituent elements
@@ -55,45 +71,42 @@ def partition_md(
         The string representation of the markdown document.
     url
         The URL of a webpage to parse. Only for URLs that return a markdown document.
-    include_page_breaks
-        If True, the output will include page breaks if the filetype supports it.
-    include_metadata
-        Determines whether or not metadata is included in the output.
-    parser
-        The parser to use for parsing the markdown document. If None, default parser will be used.
     metadata_last_modified
         The last modified date for the document.
     languages
-        User defined value for `metadata.languages` if provided. Otherwise language is detected
-        using naive Bayesian filter via `langdetect`. Multiple languages indicates text could be
-        in either language.
-        Additional Parameters:
-            detect_language_per_element
-                Detect language per element instead of at the document level.
-    date_from_file_object
-        Applies only when providing file via `file` parameter. If this option is True, attempt
-        infer last_modified metadata from bytes, otherwise set it to None.
+        The languages present in the document. Use ``["auto"]`` to detect (default when None).
+        Use ``[""]`` to disable language detection.
+    encoding
+        The source encoding for filename, file, or URL bytes. When None, local files use
+        best-effort detection and URLs use the HTTP response's encoding. An explicit
+        encoding is decoded strictly and is never replaced by an automatic guess.
+
+    Other keyword arguments are forwarded to ``partition_html``. In addition, ``extensions`` may be
+    passed to ``markdown.markdown()`` as a list of registered extension names (``str``) and/or
+    configured ``markdown.extensions.Extension`` instances. The default is
+    ``["tables", "fenced_code"]``. Pass e.g. ``extensions=["tables"]`` if you need the legacy
+    behavior where ``#`` inside unfenced content is parsed as a heading (see #4006).
     """
-    # Verify that only one of the arguments was provided
+    # -- an empty document yields no elements, like the other text-based partitioners --
+    if text == "" and file is None and filename is None and url is None:
+        return []
+
     if text is None:
         text = ""
 
+    # -- verify that only one of the arguments was provided --
     exactly_one(filename=filename, file=file, text=text, url=url)
 
-    last_modification_date = None
+    last_modified = get_last_modified_date(filename) if filename else None
+
     if filename is not None:
-        last_modification_date = get_last_modified_date(filename)
-        with open(filename, encoding="utf8") as f:
-            text = optional_decode(f.read())
+        _, text = read_txt_file(filename=filename, encoding=encoding)
 
     elif file is not None:
-        last_modification_date = (
-            get_last_modified_date_from_file(file) if date_from_file_object else None
-        )
-        text = optional_decode(file.read())
+        _, text = read_txt_file(file=file, encoding=encoding)
 
     elif url is not None:
-        response = requests.get(url)
+        response = safe_get(url)
         if not response.ok:
             raise ValueError(f"URL return an error: {response.status_code}")
 
@@ -103,18 +116,23 @@ def partition_md(
                 f"Expected content type text/markdown. Got {content_type}.",
             )
 
-        text = response.text
+        text = response.content.decode(encoding) if encoding else response.text
 
-    html = markdown.markdown(text, extensions=["tables"])
-
-    return partition_html(
-        text=html,
-        include_page_breaks=include_page_breaks,
-        include_metadata=include_metadata,
-        source_format="md",
-        metadata_filename=metadata_filename,
-        metadata_last_modified=metadata_last_modified or last_modification_date,
-        languages=languages,
-        detect_language_per_element=detect_language_per_element,
-        detection_origin=DETECTION_ORIGIN,
+    # -- optional markdown extensions; default matches historical partition_md behavior --
+    extensions = _validate_markdown_extensions(
+        kwargs.pop("extensions", _DEFAULT_MARKDOWN_EXTENSIONS)
     )
+
+    html = markdown.markdown(text, extensions=extensions)
+
+    html_kwargs: dict[str, Any] = {
+        "text": html,
+        "metadata_filename": metadata_filename or filename,
+        "metadata_file_type": FileType.MD,
+        "metadata_last_modified": metadata_last_modified or last_modified,
+        "detection_origin": DETECTION_ORIGIN,
+        **kwargs,
+    }
+    if languages is not None:
+        html_kwargs["languages"] = languages
+    return partition_html(**html_kwargs)

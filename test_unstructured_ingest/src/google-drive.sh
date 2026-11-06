@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# shellcheck disable=SC2329  # Functions are invoked indirectly
+
 set -e
 
 SRC_PATH=$(dirname "$(realpath "$0")")
@@ -35,20 +37,23 @@ fi
 GCP_INGEST_SERVICE_KEY_FILE=$(mktemp)
 echo "$GCP_INGEST_SERVICE_KEY" >"$GCP_INGEST_SERVICE_KEY_FILE"
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   google-drive \
   --download-dir "$DOWNLOAD_DIR" \
-  --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_processed,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth,metadata.data_source.version \
+  --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_processed,metadata.data_source.filesize_bytes,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth,metadata.data_source.version \
   --num-processes "$max_processes" \
   --strategy hi_res \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --drive-id 1OQZ66OHBE30rNsNa7dweGLfRmXvkT_jr \
-  --service-account-key "$GCP_INGEST_SERVICE_KEY_FILE" \
-  --work-dir "$WORK_DIR"
+  --service-account-key-path "$GCP_INGEST_SERVICE_KEY_FILE" \
+  --recursive \
+  --extensions "pdf,docx" \
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 set +e
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

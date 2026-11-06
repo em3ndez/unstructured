@@ -43,21 +43,21 @@ if [ -z "$SALESFORCE_PRIVATE_KEY_PATH" ]; then
   echo "$SALESFORCE_PRIVATE_KEY" >"$SALESFORCE_PRIVATE_KEY_PATH"
 fi
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   salesforce \
   --categories "EmailMessage,Campaign" \
   --download-dir "$DOWNLOAD_DIR" \
   --username "$SALESFORCE_USERNAME" \
   --consumer-key "$SALESFORCE_CONSUMER_KEY" \
-  --private-key "$SALESFORCE_PRIVATE_KEY_PATH" \
-  --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_processed,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
+  --private-key-path "$SALESFORCE_PRIVATE_KEY_PATH" \
+  --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_processed,metadata.data_source.filesize_bytes,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
   --num-processes "$max_processes" \
   --preserve-downloads \
-  --recursive \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

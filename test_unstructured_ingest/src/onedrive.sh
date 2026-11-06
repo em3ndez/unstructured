@@ -29,16 +29,15 @@ if [ -z "$MS_CLIENT_ID" ] || [ -z "$MS_CLIENT_CRED" ] || [ -z "$MS_USER_PNAME" ]
   exit 8
 fi
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   onedrive \
   --download-dir "$DOWNLOAD_DIR" \
-  --metadata-exclude file_directory,metadata.data_source.date_processed,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
+  --metadata-exclude file_directory,metadata.data_source.date_processed,metadata.data_source.filesize_bytes,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
   --num-processes "$max_processes" \
   --strategy hi_res \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --client-cred "$MS_CLIENT_CRED" \
   --client-id "$MS_CLIENT_ID" \
@@ -46,6 +45,8 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --user-pname "$MS_USER_PNAME" \
   --path '/utic-test-ingest-fixtures' \
   --recursive \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from google.cloud.vision import Image, ImageAnnotatorClient, Paragraph, TextAnnotation
+from google.cloud.vision import Image, ImageAnnotatorClient, ImageContext, Paragraph, TextAnnotation
 
 from unstructured.logger import logger, trace_logger
 from unstructured.partition.utils.config import env_config
@@ -12,14 +12,15 @@ from unstructured.partition.utils.ocr_models.ocr_interface import OCRAgent
 
 if TYPE_CHECKING:
     from PIL import Image as PILImage
-    from unstructured_inference.inference.elements import TextRegion
-    from unstructured_inference.inference.layoutelement import LayoutElement
+    from unstructured_inference.inference.elements import TextRegion, TextRegions
+    from unstructured_inference.inference.layoutelement import LayoutElements
 
 
 class OCRAgentGoogleVision(OCRAgent):
     """OCR service implementation for Google Vision API."""
 
-    def __init__(self) -> None:
+    def __init__(self, language: Optional[str] = None) -> None:
+        self.language = language
         client_options = {}
         api_endpoint = env_config.GOOGLEVISION_API_ENDPOINT
         if api_endpoint:
@@ -32,49 +33,50 @@ class OCRAgentGoogleVision(OCRAgent):
     def is_text_sorted(self) -> bool:
         return True
 
-    def get_text_from_image(self, image: PILImage.Image, ocr_languages: str = "eng") -> str:
+    def get_text_from_image(self, image: PILImage.Image) -> str:
+        image_context = ImageContext(language_hints=[self.language]) if self.language else None
         with BytesIO() as buffer:
             image.save(buffer, format="PNG")
-            response = self.client.document_text_detection(image=Image(content=buffer.getvalue()))
+            response = self.client.document_text_detection(
+                image=Image(content=buffer.getvalue()), image_context=image_context
+            )
         document = response.full_text_annotation
         assert isinstance(document, TextAnnotation)
         return document.text
 
-    def get_layout_from_image(
-        self, image: PILImage.Image, ocr_languages: str = "eng"
-    ) -> list[TextRegion]:
+    def get_layout_from_image(self, image: PILImage.Image) -> TextRegions:
         trace_logger.detail("Processing entire page OCR with Google Vision API...")
+        image_context = ImageContext(language_hints=[self.language]) if self.language else None
         with BytesIO() as buffer:
             image.save(buffer, format="PNG")
-            response = self.client.document_text_detection(image=Image(content=buffer.getvalue()))
+            response = self.client.document_text_detection(
+                image=Image(content=buffer.getvalue()), image_context=image_context
+            )
         document = response.full_text_annotation
         assert isinstance(document, TextAnnotation)
         regions = self._parse_regions(document)
         return regions
 
-    def get_layout_elements_from_image(
-        self, image: PILImage.Image, ocr_languages: str = "eng"
-    ) -> list[LayoutElement]:
+    def get_layout_elements_from_image(self, image: PILImage.Image) -> LayoutElements:
         from unstructured.partition.pdf_image.inference_utils import (
             build_layout_elements_from_ocr_regions,
         )
 
         ocr_regions = self.get_layout_from_image(
             image,
-            ocr_languages=ocr_languages,
         )
         ocr_text = self.get_text_from_image(
             image,
-            ocr_languages=ocr_languages,
         )
-        layout_elements = build_layout_elements_from_ocr_regions(
+        return build_layout_elements_from_ocr_regions(
             ocr_regions=ocr_regions,
             ocr_text=ocr_text,
             group_by_ocr_text=False,
         )
-        return layout_elements
 
-    def _parse_regions(self, ocr_data: TextAnnotation) -> list[TextRegion]:
+    def _parse_regions(self, ocr_data: TextAnnotation) -> TextRegions:
+        from unstructured_inference.inference.elements import TextRegions
+
         from unstructured.partition.pdf_image.inference_utils import build_text_region_from_coords
 
         text_regions: list[TextRegion] = []
@@ -93,7 +95,7 @@ class OCRAgentGoogleVision(OCRAgent):
                         source=Source.OCR_GOOGLEVISION,
                     )
                     text_regions.append(text_region)
-        return text_regions
+        return TextRegions.from_list(text_regions)
 
     def _get_text_from_paragraph(self, paragraph: Paragraph) -> str:
         breaks = TextAnnotation.DetectedBreak.BreakType

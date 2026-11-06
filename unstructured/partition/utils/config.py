@@ -11,13 +11,22 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
-from unstructured.partition.utils.constants import OCR_AGENT_TESSERACT
+from unstructured.partition.utils.constants import OCR_AGENT_TESSERACT, STT_AGENT_WHISPER
+
+
+def _tempdir_process_key() -> int:
+    """Process-group id on POSIX so children share one temp dir; process id on Windows."""
+    getpgid = getattr(os, "getpgid", None)
+    if getpgid is not None:
+        return getpgid(0)
+    return os.getpid()
 
 
 @lru_cache(maxsize=1)
 def get_tempdir(dir: str) -> str:
-    tempdir = Path(dir) / f"tmp/{os.getpgid(0)}"
+    tempdir = Path(dir) / f"tmp/{_tempdir_process_key()}"
     return str(tempdir)
 
 
@@ -96,6 +105,11 @@ class ENVConfig:
         return self._get_int("TESSERACT_OPTIMUM_TEXT_HEIGHT", 20)
 
     @property
+    def TESSERACT_CHARACTER_CONFIDENCE_THRESHOLD(self) -> int:
+        """Tesseract predictions with confidence below this threshold are ignored"""
+        return self._get_float("TESSERACT_CHARACTER_CONFIDENCE_THRESHOLD", 0.0)
+
+    @property
     def GOOGLEVISION_API_ENDPOINT(self) -> str:
         """API endpoint to use for Google Vision"""
         return self._get_string("GOOGLEVISION_API_ENDPOINT", "")
@@ -104,6 +118,58 @@ class ENVConfig:
     def OCR_AGENT(self) -> str:
         """OCR Agent to use"""
         return self._get_string("OCR_AGENT", OCR_AGENT_TESSERACT)
+
+    @property
+    def OCR_AGENT_CACHE_SIZE(self) -> int:
+        """Maximum number of OCR agents to cache per process"""
+        return self._get_int("OCR_AGENT_CACHE_SIZE", 1)
+
+    @property
+    def STT_AGENT_CACHE_SIZE(self) -> int:
+        """Maximum number of speech-to-text agents to cache per process."""
+        return self._get_int("STT_AGENT_CACHE_SIZE", 1)
+
+    @property
+    def STT_AGENT(self) -> str:
+        """Speech-to-text agent module for partition_audio (e.g. Whisper)."""
+        return self._get_string("STT_AGENT", STT_AGENT_WHISPER)
+
+    @property
+    def WHISPER_MODEL_SIZE(self) -> str:
+        """Whisper model size for SpeechToTextAgentWhisper.
+
+        One of: tiny, base, small, medium, large, large-v3.
+        Larger models are more accurate but slower and use more memory (~1GB VRAM for tiny
+        to ~10GB for large-v3). Default is \"base\".
+        """
+        return self._get_string("WHISPER_MODEL_SIZE", "base")
+
+    @property
+    def WHISPER_DEVICE(self) -> str:
+        """Device for Whisper model (e.g. \"cuda\", \"cpu\", \"cuda:0\").
+
+        When empty or not set, Whisper auto-selects (CUDA if available, else CPU).
+        Set to \"cpu\" to force CPU; set to \"cuda\" or \"cuda:0\" for GPU.
+        """
+        return self._get_string("WHISPER_DEVICE", "")
+
+    @property
+    def WHISPER_FP16(self) -> bool:
+        """Use FP16 for Whisper transcription.
+
+        FP16 gives roughly 2x GPU speedup on CUDA with minimal quality impact, but is
+        unsupported on CPU and will raise a RuntimeError there. The default is auto-detected:
+        True when a CUDA GPU is available, False otherwise.
+        Set WHISPER_FP16=true/false explicitly to override. When set to empty, treated as false.
+        """
+        if "WHISPER_FP16" not in os.environ:
+            try:
+                import torch
+
+                return bool(torch.cuda.is_available())
+            except ImportError:
+                return False
+        return self._get_bool("WHISPER_FP16", False)
 
     @property
     def EXTRACT_IMAGE_BLOCK_CROP_HORIZONTAL_PAD(self) -> int:
@@ -150,12 +216,22 @@ class ENVConfig:
         return self._get_float("EMBEDDED_TEXT_AGGREGATION_SUBREGION_THRESHOLD", 0.99)
 
     @property
+    def EMBEDDED_TEXT_SAME_REGION_THRESHOLD(self) -> float:
+        """threshold to consider the bounding boxes of two embedded images as the same region"""
+        return self._get_float("EMBEDDED_TEXT_SAME_REGION_THRESHOLD", 0.9)
+
+    @property
     def PDF_ANNOTATION_THRESHOLD(self) -> float:
         """The threshold value (between 0.0 and 1.0) that determines the minimum overlap required
         for an annotation to be considered within the element.
         """
 
         return self._get_float("PDF_ANNOTATION_THRESHOLD", 0.9)
+
+    @property
+    def PDF_MAX_EMBED_LOW_FIDELITY_TEXT_RATIO(self) -> float:
+        """maximum ratio of low fidelity charcaters for a text to be considered embedded text"""
+        return self._get_float("PDF_MAX_EMBED_LOW_FIDELITY_TEXT_RATIO", 0.1)
 
     @property
     def GLOBAL_WORKING_DIR_ENABLED(self) -> bool:
@@ -179,6 +255,107 @@ class ENVConfig:
         if self.GLOBAL_WORKING_DIR_ENABLED:
             self._setup_tmpdir(tmpdir)
         return tmpdir
+
+    @property
+    def ANALYSIS_DUMP_OD_SKIP(self) -> bool:
+        """Analysis dump object detection skip flag."""
+        return self._get_bool("ANALYSIS_DUMP_OD_SKIP", False)
+
+    @property
+    def ANALYSIS_BBOX_SKIP(self) -> bool:
+        """Analysis draw bboxes on pages skip flag."""
+        return self._get_bool("ANALYSIS_BBOX_SKIP", False)
+
+    @property
+    def ANALYSIS_BBOX_DRAW_GRID(self) -> bool:
+        """Flag for drawing the analysis bboxes on a single image (as grid)"""
+        return self._get_bool("ANALYSIS_BBOX_DRAW_GRID", False)
+
+    @property
+    def ANALYSIS_BBOX_DRAW_CAPTION(self) -> bool:
+        """Flag for drawing the caption above the analysed page (for e.g. layout source)"""
+        return self._get_bool("ANALYSIS_BBOX_DRAW_CAPTION", True)
+
+    @property
+    def ANALYSIS_BBOX_RESIZE(self) -> Optional[float]:
+        """Analaysis bbox resize value"""
+        resize = self._get_float("ANALYSIS_BBOX_RESIZE", -1.0)
+        if resize == -1.0:
+            return None
+        return resize
+
+    @property
+    def ANALYSIS_BBOX_FORMAT(self) -> str:
+        """The format for analysed pages with bboxes drawn on them. Default is 'png'."""
+        return self._get_string("ANALYSIS_BBOX_FORMAT", "png")
+
+    @property
+    def TEXT_COVERAGE_THRESHOLD(self) -> float:
+        """the minimum iou between extracted text bboxes and their target inferred element bbox for
+        the inferred element to be considered contaning extracted text"""
+        return self._get_float("TEXT_COVERAGE_THRESHOLD", 0.25)
+
+    @property
+    def PDF_CHAR_DUPLICATE_THRESHOLD(self) -> float:
+        """Maximum pixel distance to consider two characters as duplicates (fake bold rendering).
+
+        Some PDFs create bold text by rendering the same character twice at slightly offset
+        positions. This threshold determines how close two identical characters must be to be
+        considered duplicates. The algorithm also checks for bounding box overlap to avoid
+        false positives with legitimate double letters. Set to 0 to disable duplicate character
+        removal.
+        """
+        return self._get_float("PDF_CHAR_DUPLICATE_THRESHOLD", 2.0)
+
+    @property
+    def PDF_CHAR_OVERLAP_RATIO_THRESHOLD(self) -> float:
+        """Minimum overlap ratio to consider two characters as duplicates (fake bold rendering).
+
+        When detecting fake-bold duplicates, this threshold determines the minimum bounding box
+        overlap ratio required. Fake-bold duplicates typically have >70% overlap, while legitimate
+        consecutive identical letters (like "ll" in "skills") have <30% overlap. Default is 0.5
+        (50%) as a conservative threshold. Valid range is 0.0 to 1.0.
+        """
+        return self._get_float("PDF_CHAR_OVERLAP_RATIO_THRESHOLD", 0.5)
+
+    @property
+    def PDF_RENDER_DPI(self) -> int:
+        """The DPI to use for rendering PDF pages"""
+        return self._get_int("PDF_RENDER_DPI", 350)
+
+    @property
+    def PDF_RENDER_MAX_PIXELS_PER_PAGE(self) -> int:
+        """Maximum rendered pixels allowed for a single PDF page"""
+        return self._get_int("PDF_RENDER_MAX_PIXELS_PER_PAGE", 1_000_000_000)
+
+    @property
+    def XLSX_MAX_CELLS(self) -> int:
+        """Maximum worksheet cells, summed across all worksheets, a spreadsheet may span"""
+        return self._get_int("XLSX_MAX_CELLS", 5_000_000)
+
+    @property
+    def DOCX_TABLE_MAX_CELLS(self) -> int:
+        """Maximum layout-grid cells, summed across a DOCX document's tables, rendered as HTML"""
+        return self._get_int("DOCX_TABLE_MAX_CELLS", 5_000_000)
+
+    @property
+    def CSV_MAX_CELLS(self) -> int:
+        """Maximum `rows x columns` cells a CSV or TSV file may span"""
+        return self._get_int("CSV_MAX_CELLS", 5_000_000)
+
+    @property
+    def IMAGE_MAX_TOTAL_PIXELS(self) -> int:
+        """Maximum pixels, summed across all frames, an image file may decode to"""
+        return self._get_int("IMAGE_MAX_TOTAL_PIXELS", 500_000_000)
+
+    @property
+    def UNSTRUCTURED_USE_LANGDETECT_RS(self) -> bool:
+        """Use langdetect-rs instead of langdetect for partition language detection
+
+        Read once, when `unstructured.partition.common.lang` is first imported. Falls back to
+        langdetect with a warning if langdetect-rs is not installed.
+        """
+        return self._get_bool("UNSTRUCTURED_USE_LANGDETECT_RS", False)
 
 
 env_config = ENVConfig()

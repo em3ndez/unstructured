@@ -2,21 +2,37 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import pathlib
 import tempfile
+from collections.abc import Iterable
 
 import pytest
 from pytest_mock import MockFixture
 
-from unstructured.documents.elements import CompositeElement
-from unstructured.file_utils.filetype import FileType, detect_filetype
+from test_unstructured.unit_utils import example_doc_path
+from unstructured.chunking import register_chunking_strategy
+from unstructured.chunking.dispatch import reconstruct_table_from_chunks
+from unstructured.chunking.title import chunk_by_title
+from unstructured.documents.elements import (
+    CompositeElement,
+    Element,
+    ElementMetadata,
+    Table,
+    TableChunk,
+    Text,
+    Title,
+)
+from unstructured.file_utils.filetype import detect_filetype
+from unstructured.file_utils.model import FileType
 from unstructured.partition.email import partition_email
 from unstructured.partition.html import partition_html
 from unstructured.partition.json import partition_json
 from unstructured.partition.text import partition_text
 from unstructured.partition.xml import partition_xml
-from unstructured.staging.base import elements_to_json
+from unstructured.staging.base import elements_from_json, elements_to_dicts, elements_to_json
 
 DIRECTORY = pathlib.Path(__file__).parent.resolve()
 
@@ -35,16 +51,121 @@ def test_it_chunks_elements_when_a_chunking_strategy_is_specified():
     chunks = partition_json(
         "example-docs/spring-weather.html.json", chunking_strategy="basic", max_characters=1500
     )
+    repeated = partition_json(
+        "example-docs/spring-weather.html.json", chunking_strategy="basic", max_characters=1500
+    )
 
-    assert len(chunks) == 10
+    assert len(chunks) == 9
     assert all(isinstance(ch, CompositeElement) for ch in chunks)
+    assert [chunk.id for chunk in chunks] == [chunk.id for chunk in repeated]
+
+
+def test_partition_json_preserves_serialized_elements():
+    path = example_doc_path("simple.json")
+
+    expected = elements_from_json(filename=path)
+    actual = partition_json(filename=path)
+
+    assert elements_to_dicts(actual) == elements_to_dicts(expected)
+
+
+def test_partition_json_preserves_attachment_filename_during_rehydration():
+    serialized = elements_to_dicts(
+        [
+            Text(
+                "attachment",
+                metadata=ElementMetadata(
+                    filename="invoice.pdf",
+                    attached_to_filename="message.eml",
+                ),
+            )
+        ]
+    )
+
+    elements = partition_json(text=json.dumps(serialized), metadata_filename="renamed.eml")
+
+    assert elements[0].metadata.filename == "invoice.pdf"
+    assert elements[0].metadata.attached_to_filename == "message.eml"
+
+
+def test_partition_json_passes_complete_call_arguments_to_custom_chunker():
+    call_args: dict[str, object] = {}
+
+    def capture_call_args(
+        elements: Iterable[Element],
+        *,
+        max_characters: int | None = None,
+        filename: str | None = None,
+        file: object = None,
+        text: str | None = None,
+        metadata_last_modified: str | None = None,
+        metadata_filename: str | None = None,
+        encoding: str | None = None,
+    ) -> list[Element]:
+        call_args.update(
+            filename=filename,
+            file=file,
+            text=text,
+            metadata_last_modified=metadata_last_modified,
+            metadata_filename=metadata_filename,
+            encoding=encoding,
+        )
+        return list(elements)
+
+    register_chunking_strategy("capture-json-call-args", capture_call_args)
+
+    # -- empty input: no encoding is supplied, so the chunker receives None --
+    stream = io.BytesIO(b"  \n")
+    assert (
+        partition_json(
+            file=stream,
+            metadata_last_modified="2020-07-05T09:24:28",
+            metadata_filename="cars.json",
+            chunking_strategy="capture-json-call-args",
+        )
+        == []
+    )
+    assert call_args == {
+        "filename": None,
+        "file": stream,
+        "text": None,
+        "metadata_last_modified": "2020-07-05T09:24:28",
+        "metadata_filename": "cars.json",
+        "encoding": None,
+    }
+
+    # -- rehydration: the explicit encoding reaches the registered chunker --
+    call_args.clear()
+    rehydrated = json.dumps(
+        [{"type": "Title", "element_id": "t1", "text": "hello", "metadata": {}}]
+    )
+    assert partition_json(
+        text=rehydrated,
+        encoding="utf-16",
+        chunking_strategy="capture-json-call-args",
+    )
+    assert call_args["encoding"] == "utf-16"
+    assert call_args["text"] == rehydrated
+    assert call_args["file"] is None
+    assert call_args["filename"] is None
+
+    # -- arbitrary JSON: the explicit encoding reaches the registered chunker too --
+    call_args.clear()
+    arbitrary = '{"hi": "there"}'
+    assert partition_json(
+        text=arbitrary,
+        encoding="utf-8",
+        chunking_strategy="capture-json-call-args",
+    )
+    assert call_args["encoding"] == "utf-8"
+    assert call_args["text"] == arbitrary
 
 
 @pytest.mark.parametrize("filename", test_files)
 def test_partition_json_from_filename(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
+    path = example_doc_path(filename)
     elements = []
-    filetype = detect_filetype(filename=path)
+    filetype = FileType.from_extension(os.path.splitext(path)[1])
     if filetype == FileType.TXT:
         elements = partition_text(filename=path)
     if filetype == FileType.HTML:
@@ -71,9 +192,9 @@ def test_partition_json_from_filename(filename: str):
 
 @pytest.mark.parametrize("filename", test_files)
 def test_partition_json_from_filename_with_metadata_filename(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
+    path = example_doc_path(filename)
     elements = []
-    filetype = detect_filetype(filename=path)
+    filetype = FileType.from_extension(os.path.splitext(path)[1])
     if filetype == FileType.TXT:
         elements = partition_text(filename=path)
     if filetype == FileType.HTML:
@@ -96,9 +217,9 @@ def test_partition_json_from_filename_with_metadata_filename(filename: str):
 
 @pytest.mark.parametrize("filename", test_files)
 def test_partition_json_from_file(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
+    path = example_doc_path(filename)
     elements = []
-    filetype = detect_filetype(filename=path)
+    filetype = FileType.from_extension(os.path.splitext(path)[1])
     if filetype == FileType.TXT:
         elements = partition_text(filename=path)
     if filetype == FileType.HTML:
@@ -125,9 +246,9 @@ def test_partition_json_from_file(filename: str):
 
 @pytest.mark.parametrize("filename", test_files)
 def test_partition_json_from_file_with_metadata_filename(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
+    path = example_doc_path(filename)
     elements = []
-    filetype = detect_filetype(filename=path)
+    filetype = FileType.from_extension(os.path.splitext(path)[1])
     if filetype == FileType.TXT:
         elements = partition_text(filename=path)
     if filetype == FileType.HTML:
@@ -149,9 +270,9 @@ def test_partition_json_from_file_with_metadata_filename(filename: str):
 
 @pytest.mark.parametrize("filename", test_files)
 def test_partition_json_from_text(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
+    path = example_doc_path(filename)
     elements = []
-    filetype = detect_filetype(filename=path)
+    filetype = FileType.from_extension(os.path.splitext(path)[1])
     if filetype == FileType.TXT:
         elements = partition_text(filename=path)
     if filetype == FileType.HTML:
@@ -186,14 +307,24 @@ def test_partition_json_works_with_empty_string():
     assert partition_json(text="") == []
 
 
+def test_partition_json_works_with_a_whitespace_only_file():
+    # -- the file= route reaches the in-body empty-document guard (text="" is caught earlier) --
+    assert partition_json(file=io.BytesIO(b"  \n ")) == []
+
+
+def test_partition_json_emits_Text_element_for_an_empty_object():
+    # -- an empty object is a (trivial) document: one Text containing "{}" --
+    assert partition_json(text="{}") == [Text(text="{}")]
+
+
 def test_partition_json_works_with_empty_list():
     assert partition_json(text="[]") == []
 
 
 def test_partition_json_raises_with_too_many_specified():
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", "fake-text.txt")
+    path = example_doc_path("fake-text.txt")
     elements = []
-    filetype = detect_filetype(filename=path)
+    filetype = FileType.from_extension(os.path.splitext(path)[1])
     if filetype == FileType.TXT:
         elements = partition_text(filename=path)
     if filetype == FileType.HTML:
@@ -222,197 +353,612 @@ def test_partition_json_raises_with_too_many_specified():
         partition_json(filename=test_path, file=f, text=text)
 
 
-@pytest.mark.parametrize("filename", test_files)
-def test_partition_json_from_filename_exclude_metadata(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
-    elements = []
-    filetype = detect_filetype(filename=path)
-    if filetype == FileType.TXT:
-        elements = partition_text(filename=path)
-    if filetype == FileType.HTML:
-        elements = partition_html(filename=path)
-    if filetype == FileType.XML:
-        elements = partition_xml(filename=path)
-    if filetype == FileType.EML:
-        elements = partition_email(filename=path)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _filename = os.path.basename(filename)
-        test_path = os.path.join(tmpdir, _filename + ".json")
-        elements_to_json(elements, filename=test_path, indent=2)
-        test_elements = partition_json(filename=test_path, include_metadata=False)
-
-    for i in range(len(test_elements)):
-        assert any(test_elements[i].metadata.to_dict()) is False
+# -- .metadata.last_modified ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("filename", test_files)
-def test_partition_json_from_file_exclude_metadata(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
-    elements = []
-    filetype = detect_filetype(filename=path)
-    if filetype == FileType.TXT:
-        elements = partition_text(filename=path)
-    if filetype == FileType.HTML:
-        elements = partition_html(filename=path)
-    if filetype == FileType.XML:
-        elements = partition_xml(filename=path)
-    if filetype == FileType.EML:
-        elements = partition_email(filename=path)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _filename = os.path.basename(filename)
-        test_path = os.path.join(tmpdir, _filename + ".json")
-        elements_to_json(elements, filename=test_path, indent=2)
-        with open(test_path, "rb") as f:
-            test_elements = partition_json(file=f, include_metadata=False)
-
-    for i in range(len(test_elements)):
-        assert any(test_elements[i].metadata.to_dict()) is False
-
-
-@pytest.mark.parametrize("filename", test_files)
-def test_partition_json_from_text_exclude_metadata(filename: str):
-    path = os.path.join(DIRECTORY, "..", "..", "example-docs", filename)
-    elements = []
-    filetype = detect_filetype(filename=path)
-    if filetype == FileType.TXT:
-        elements = partition_text(filename=path)
-    if filetype == FileType.HTML:
-        elements = partition_html(filename=path)
-    if filetype == FileType.XML:
-        elements = partition_xml(filename=path)
-    if filetype == FileType.EML:
-        elements = partition_email(filename=path)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _filename = os.path.basename(filename)
-        test_path = os.path.join(tmpdir, _filename + ".json")
-        elements_to_json(elements, filename=test_path, indent=2)
-        with open(test_path) as f:
-            text = f.read()
-        test_elements = partition_json(text=text, include_metadata=False)
-
-    for i in range(len(test_elements)):
-        assert any(test_elements[i].metadata.to_dict()) is False
-
-
-def test_partition_json_metadata_date(mocker: MockFixture):
-    mocked_last_modification_date = "2029-07-05T09:24:28"
+def test_partition_json_preserves_serialized_last_modified_from_file_path(
+    mocker: MockFixture,
+):
+    filesystem_last_modified = "2029-07-05T09:24:28"
     mocker.patch(
-        "unstructured.partition.json.get_last_modified_date",
-        return_value=mocked_last_modification_date,
+        "unstructured.partition.json.get_last_modified_date", return_value=filesystem_last_modified
     )
+    path = example_doc_path("spring-weather.html.json")
 
-    elements = partition_json("example-docs/spring-weather.html.json")
+    expected = elements_from_json(filename=path)
+    elements = partition_json(path)
 
-    assert elements[0].metadata.last_modified == mocked_last_modification_date
+    assert [e.metadata.last_modified for e in elements] == [
+        e.metadata.last_modified for e in expected
+    ]
 
 
-def test_partition_json_with_custom_metadata_date(mocker: MockFixture):
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-    expected_last_modification_date = "2020-07-05T09:24:28"
+def test_partition_json_arbitrary_file_gets_last_modified_from_filesystem(mocker: MockFixture):
+    filesystem_last_modified = "2029-07-05T09:24:28"
     mocker.patch(
-        "unstructured.partition.json.get_last_modified_date",
-        return_value=mocked_last_modification_date,
+        "unstructured.partition.json.get_last_modified_date", return_value=filesystem_last_modified
     )
 
-    elements = partition_json(
-        "example-docs/spring-weather.html.json",
-        metadata_last_modified=expected_last_modification_date,
+    elements = partition_json(example_doc_path("arbitrary-records.json"))
+
+    assert all(e.metadata.last_modified == filesystem_last_modified for e in elements)
+
+
+def test_partition_json_arbitrary_chunks_preserve_last_modified_on_orig_elements():
+    metadata_last_modified = "2020-07-05T09:24:28"
+
+    chunks = partition_json(
+        text='[{"make": "Fabrikam"}, {"make": "Contoso"}]',
+        metadata_last_modified=metadata_last_modified,
+        chunking_strategy="basic",
     )
 
-    assert elements[0].metadata.last_modified == expected_last_modification_date
-
-
-def test_partition_json_from_file_metadata_date(mocker: MockFixture):
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-    mocker.patch(
-        "unstructured.partition.json.get_last_modified_date_from_file",
-        return_value=mocked_last_modification_date,
+    orig_elements = [
+        orig_element for chunk in chunks for orig_element in chunk.metadata.orig_elements or []
+    ]
+    assert orig_elements
+    assert all(
+        element.metadata.last_modified == metadata_last_modified for element in orig_elements
     )
 
+
+@pytest.mark.parametrize("strategy", ["basic", "by_title"])
+@pytest.mark.parametrize("stored_timestamp", [None, "2019-01-01T00:00:00"])
+@pytest.mark.parametrize("override", [None, "2020-07-05T09:24:28"])
+def test_partition_json_rehydrated_chunks_preserve_original_timestamps(
+    strategy, stored_timestamp, override
+):
+    source = Text(
+        "Saved document content.", metadata=ElementMetadata(last_modified=stored_timestamp)
+    )
+    chunks = partition_json(
+        text=elements_to_json([source]),
+        metadata_last_modified=override,
+        chunking_strategy=strategy,
+    )
+    expected = override or stored_timestamp
+    for elements in (chunks, elements_from_json(text=elements_to_json(chunks))):
+        assert elements
+        assert all(element.metadata.last_modified == expected for element in elements)
+        originals = [
+            original for chunk in elements for original in chunk.metadata.orig_elements or []
+        ]
+        assert originals
+        assert all(original.metadata.last_modified == expected for original in originals)
+
+
+def test_partition_json_from_file_gets_last_modified_None():
     with open("example-docs/spring-weather.html.json", "rb") as f:
         elements = partition_json(file=f)
 
-    assert elements[0].metadata.last_modified is None
+    assert all(e.metadata.last_modified is None for e in elements)
 
 
-def test_partition_json_from_file_explicit_get_metadata_date(
-    mocker,
-    filename="example-docs/spring-weather.html.json",
-):
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-
-    mocker.patch(
-        "unstructured.partition.json.get_last_modified_date_from_file",
-        return_value=mocked_last_modification_date,
-    )
-
-    with open(filename, "rb") as f:
-        elements = partition_json(
-            file=f,
-            date_from_file_object=True,
-        )
-
-    assert elements[0].metadata.last_modified == mocked_last_modification_date
-
-
-def test_partition_json_from_file_with_custom_metadata_date(mocker: MockFixture):
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-    expected_last_modification_date = "2020-07-05T09:24:28"
-    mocker.patch(
-        "unstructured.partition.json.get_last_modified_date_from_file",
-        return_value=mocked_last_modification_date,
-    )
-
-    with open("example-docs/spring-weather.html.json", "rb") as f:
-        elements = partition_json(file=f, metadata_last_modified=expected_last_modification_date)
-
-    assert elements[0].metadata.last_modified == expected_last_modification_date
-
-
-def test_partition_json_from_text_metadata_date():
+def test_partition_json_from_text_gets_last_modified_None():
     with open("example-docs/spring-weather.html.json") as f:
         text = f.read()
 
     elements = partition_json(text=text)
 
-    assert elements[0].metadata.last_modified is None
+    assert all(e.metadata.last_modified is None for e in elements)
 
 
-def test_partition_json_from_text_with_custom_metadata_date():
-    expected_last_modification_date = "2020-07-05T09:24:28"
+def test_partition_json_from_file_path_prefers_metadata_last_modified(mocker: MockFixture):
+    filesystem_last_modified = "2029-07-05T09:24:28"
+    metadata_last_modified = "2020-07-05T09:24:28"
+    mocker.patch(
+        "unstructured.partition.json.get_last_modified_date", return_value=filesystem_last_modified
+    )
+
+    elements = partition_json(
+        "example-docs/spring-weather.html.json", metadata_last_modified=metadata_last_modified
+    )
+
+    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
+
+
+def test_partition_json_from_file_prefers_metadata_last_modified():
+    metadata_last_modified = "2020-07-05T09:24:28"
+    with open(example_doc_path("spring-weather.html.json"), "rb") as f:
+        elements = partition_json(file=f, metadata_last_modified=metadata_last_modified)
+
+    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
+
+
+def test_partition_json_from_text_prefers_metadata_last_modified():
+    metadata_last_modified = "2020-07-05T09:24:28"
     with open("example-docs/spring-weather.html.json") as f:
         text = f.read()
 
-    elements = partition_json(text=text, metadata_last_modified=expected_last_modification_date)
+    elements = partition_json(text=text, metadata_last_modified=metadata_last_modified)
 
-    assert elements[0].metadata.last_modified == expected_last_modification_date
-
-
-def test_partition_json_from_file_without_metadata_date(
-    filename="example-docs/spring-weather.html.json",
-):
-    """Test partition_json() with file that are not possible to get last modified date"""
-    with open(filename, "rb") as f:
-        sf = tempfile.SpooledTemporaryFile()
-        sf.write(f.read())
-        sf.seek(0)
-        elements = partition_json(file=sf, date_from_file_object=True)
-
-    assert elements[0].metadata.last_modified is None
+    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
 
 
-def test_partition_json_raises_with_unprocessable_json():
-    # NOTE(robinson) - This is unprocessable because it is not a list of dicts,
-    # per the Unstructured ISD format
-    text = '{"hi": "there"}'
-    with pytest.raises(ValueError):
-        partition_json(text=text)
+# ------------------------------------------------------------------------------------------------
 
 
 def test_partition_json_raises_with_invalid_json():
     text = '[{"hi": "there"}]]'
     with pytest.raises(ValueError):
         partition_json(text=text)
+
+
+# -- arbitrary (non-element-schema) JSON ---------------------------------------------------------
+
+
+def it_partitions_an_arbitrary_object_into_a_single_Text_element():
+    elements = partition_json(text='{"make": "Fabrikam", "model": "F-100"}')
+
+    assert elements == [Text(text='{\n  "make": "Fabrikam",\n  "model": "F-100"\n}')]
+
+
+def and_it_adds_json_metadata_and_deterministic_ids_to_arbitrary_content():
+    elements = partition_json(
+        text='{"make": "Fabrikam"}',
+        metadata_filename="cars.json",
+        chunking_strategy="basic",
+    )
+    repeated = partition_json(
+        text='{"make": "Fabrikam"}',
+        metadata_filename="cars.json",
+        chunking_strategy="basic",
+    )
+
+    assert elements[0].metadata.filename == "cars.json"
+    assert elements[0].metadata.filetype == "application/json"
+    assert elements[0].id == repeated[0].id
+
+
+def and_it_preserves_deeply_nested_values_in_the_pretty_printed_text():
+    text = '{"site": {"address": {"city": "Springfield"}}}'
+
+    elements = partition_json(text=text)
+
+    assert len(elements) == 1
+    assert "Springfield" in elements[0].text
+
+
+def it_partitions_an_array_of_objects_into_one_Text_element_per_object_in_order():
+    text = '[{"sku": "A-100"}, {"sku": "B-200"}]'
+
+    elements = partition_json(text=text)
+
+    assert elements == [Text(text='{\n  "sku": "A-100"\n}'), Text(text='{\n  "sku": "B-200"\n}')]
+
+
+def and_it_partitions_an_arbitrary_array_file_from_disk():
+    elements = partition_json(example_doc_path("arbitrary-records.json"))
+
+    assert len(elements) == 3
+    assert all(isinstance(e, Text) for e in elements)
+    assert "Watering Can" in elements[1].text
+
+
+def it_partitions_an_array_of_scalars_into_a_single_Text_element():
+    elements = partition_json(text="[1, 2, 3]")
+
+    assert elements == [Text(text="[\n  1,\n  2,\n  3\n]")]
+
+
+def and_it_partitions_a_mixed_type_array_into_a_single_Text_element():
+    elements = partition_json(text='[{"a": 1}, 2]')
+
+    assert elements == [Text(text='[\n  {\n    "a": 1\n  },\n  2\n]')]
+
+
+def it_partitions_a_top_level_scalar_into_a_single_Text_element():
+    elements = partition_json(text='"hello"')
+
+    assert elements == [Text(text='"hello"')]
+
+
+def it_rehydrates_an_element_shaped_array_rather_than_partitioning_it():
+    # -- documented limitation: an array of customer records that happens to match the
+    # -- serialized-element schema is indistinguishable from Unstructured output, so it
+    # -- rehydrates as elements rather than partitioning as arbitrary JSON --
+    elements = partition_json(text='[{"type": "Title", "text": "x"}]')
+
+    assert elements == [Title(text="x")]
+
+
+def but_it_partitions_an_element_typed_object_with_no_text_field_as_Text():
+    # -- the other side of the limitation: a recognized element "type" without a "text" field
+    # -- cannot rehydrate, so the payload falls through and partitions as arbitrary JSON --
+    elements = partition_json(text='[{"type": "Title"}]')
+
+    assert len(elements) == 1
+    assert isinstance(elements[0], Text)
+    assert '"type": "Title"' in elements[0].text
+
+
+def it_chunks_an_arbitrary_payload_when_a_chunking_strategy_is_specified():
+    chunks = partition_json(text='{"hi": "there"}', chunking_strategy="basic")
+
+    assert len(chunks) == 1
+    assert all(isinstance(chunk, CompositeElement) for chunk in chunks)
+
+
+# -- serialized chunked-table output (TableChunk) round-trip -------------------------------------
+
+
+def it_round_trips_serialized_chunked_table_output_including_TableChunks():
+    # -- completes PR #4291: `reconstruct_table_from_chunks()` expects deserialized chunks, so
+    # -- serialized chunker output must round-trip its TableChunk elements rather than silently
+    # -- drop them --
+    rows = [(f"Item {i}", f"Description of item number {i}") for i in range(1, 25)]
+    table_text = "\n".join(f"{name} {desc}" for name, desc in rows)
+    table_html = (
+        "<table>"
+        + "".join(f"<tr><td>{name}</td><td>{desc}</td></tr>" for name, desc in rows)
+        + "</table>"
+    )
+    chunks = chunk_by_title(
+        [Title("Inventory"), Table(table_text, metadata=ElementMetadata(text_as_html=table_html))],
+        max_characters=500,
+        include_orig_elements=True,
+    )
+    assert sum(isinstance(c, TableChunk) for c in chunks) >= 2
+    # -- serialized chunker output in the wild carries `filetype` from its partition run; stamp
+    # -- the value partition_json() itself stamps so re-serialization compares byte-for-byte --
+    for chunk in chunks:
+        chunk.metadata.filetype = "application/json"
+    json_text = elements_to_json(chunks)
+    assert json_text is not None
+
+    # -- unique_element_ids=True keeps the chunker-assigned ids; hash-id reassignment (#3365)
+    # -- is orthogonal to what this test pins --
+    elements = partition_json(text=json_text, unique_element_ids=True)
+
+    assert [type(e) for e in elements] == [type(c) for c in chunks]
+    assert elements == chunks
+    assert elements_to_json(elements) == json_text
+    # -- and the rehydrated chunks feed the PR #4291 reconstruction helper --
+    [table] = reconstruct_table_from_chunks(elements)
+    assert table.text.split() == table_text.split()
+
+
+# -- element-shaped payload discrimination -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        # -- coordinates points without a coordinate-system --
+        {"coordinates": {"points": [[0, 0], [1, 1]]}},
+        # -- orig_elements that is not valid base64 --
+        {"orig_elements": "not-base64!!"},
+        # -- orig_elements that is valid base64 but not gzip-compressed element JSON --
+        {"orig_elements": "aGVsbG8="},
+    ],
+)
+def it_raises_ValueError_when_an_element_shaped_payload_has_corrupt_metadata(metadata: dict):
+    # -- an element-shaped payload that cannot rehydrate raises loudly, never leaking low-level
+    # -- exceptions like `zlib.error` or `binascii.Error` --
+    text = json.dumps([{"type": "Title", "text": "x", "metadata": metadata}])
+
+    with pytest.raises(ValueError, match="could not be reconstructed"):
+        partition_json(text=text)
+
+
+def it_partitions_a_non_element_dict_with_a_metadata_key_as_Text():
+    # -- a "metadata" key on a non-element-shaped object must not trigger metadata parsing --
+    value = {"id": 1, "metadata": {"coordinates": {"points": [[0, 0], [1, 1]]}}}
+
+    elements = partition_json(text=json.dumps([value]))
+
+    assert len(elements) == 1
+    assert isinstance(elements[0], Text)
+    assert '"id": 1' in elements[0].text
+    assert '"coordinates"' in elements[0].text
+
+
+def it_partitions_a_mixed_array_whole_with_no_partial_rehydration():
+    # -- an array mixing element-shaped and arbitrary items partitions whole as arbitrary JSON;
+    # -- no partial rehydration that silently drops the arbitrary items --
+    text = '[{"type": "Title", "text": "x"}, {"foo": "bar"}]'
+
+    elements = partition_json(text=text)
+
+    assert len(elements) == 2
+    assert all(isinstance(e, Text) for e in elements)
+    assert '"type": "Title"' in elements[0].text
+    assert '"foo": "bar"' in elements[1].text
+
+
+def it_partitions_an_element_typed_object_with_non_str_text_as_Text():
+    elements = partition_json(text='[{"type": "Title", "text": 42}]')
+
+    assert len(elements) == 1
+    assert isinstance(elements[0], Text)
+    assert '"text": 42' in elements[0].text
+
+
+def and_it_partitions_an_element_shaped_object_with_non_dict_metadata_as_Text():
+    elements = partition_json(text='[{"type": "Title", "text": "x", "metadata": "weird"}]')
+
+    assert len(elements) == 1
+    assert isinstance(elements[0], Text)
+    assert '"metadata": "weird"' in elements[0].text
+
+
+def and_it_partitions_an_object_with_an_unhashable_type_value_as_Text():
+    # -- `type` holding a non-str (here unhashable) value must not crash the shape predicate --
+    elements = partition_json(text='[{"type": ["Title"], "text": "x"}]')
+
+    assert len(elements) == 1
+    assert isinstance(elements[0], Text)
+    assert '"Title"' in elements[0].text
+
+
+def it_raises_ValueError_on_a_deeply_nested_payload_rather_than_RecursionError():
+    with pytest.raises(ValueError, match="Not a valid json"):
+        partition_json(text="[" * 200000)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["NaN", "Infinity", "-Infinity", '{"x": NaN}', "[1, Infinity, 3]"],
+)
+def it_rejects_non_standard_json_constants(payload: str):
+    # -- NaN/Infinity are accepted by json.loads by default but are not valid JSON --
+    with pytest.raises(ValueError, match="Not a valid json"):
+        partition_json(text=payload)
+
+
+def and_it_raises_ValueError_when_a_valid_payload_is_too_deep_to_pretty_print():
+    # -- json.loads() (C scanner) parses deeper than json.dumps() (pure Python) can serialize,
+    # -- so a valid payload can still fail pretty-printing; that surfaces as ValueError too --
+    text = "[" * 5000 + "1" + "]" * 5000
+
+    with pytest.raises(ValueError, match="nested too deeply"):
+        partition_json(text=text)
+
+
+# -- file= routing --------------------------------------------------------------------------------
+
+
+def it_partitions_an_arbitrary_object_from_a_file_like_object():
+    file = io.BytesIO(b'{"make": "Fabrikam", "model": "F-100"}')
+
+    elements = partition_json(file=file)
+
+    assert len(elements) == 1
+    assert isinstance(elements[0], Text)
+    assert '"make": "Fabrikam"' in elements[0].text
+
+
+def and_it_raises_ValueError_for_corrupt_element_shaped_metadata_from_a_file_like_object():
+    payload = json.dumps(
+        [{"type": "Title", "text": "x", "metadata": {"orig_elements": "aGVsbG8="}}]
+    ).encode()
+
+    with pytest.raises(ValueError, match="could not be reconstructed"):
+        partition_json(file=io.BytesIO(payload))
+
+
+def it_rehydrates_on_a_detect_then_partition_sequence_over_the_same_file_handle():
+    # -- JSON/NDJSON disambiguation restores the file to read position 0, so a follow-up
+    # -- partition of the same handle reads the full payload --
+    with open(example_doc_path("simple.json"), "rb") as f:
+        file = io.BytesIO(f.read())
+
+    assert detect_filetype(file=file) == FileType.JSON
+
+    elements = partition_json(file=file)
+
+    assert elements[0] == Title(text="These are a few of my favorite things:")
+
+
+# -- encoding -------------------------------------------------------------------------------------
+
+
+def it_honors_an_explicit_encoding_for_a_non_utf8_file():
+    # -- a UTF-16 payload is unreadable as UTF-8, so an ignored `encoding=` argument surfaces as
+    # -- UnicodeDecodeError rather than as a wrong result --
+    payload = json.dumps([{"sku": "A-100"}, {"sku": "B-200"}])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "utf16.json")
+        with open(path, "w", encoding="utf-16") as f:
+            f.write(payload)
+
+        elements = partition_json(filename=path, encoding="utf-16")
+
+    assert len(elements) == 2
+    assert '"sku": "A-100"' in elements[0].text
+
+
+def it_honors_an_explicit_encoding_for_a_non_utf8_file_like_object():
+    payload = json.dumps([{"sku": "A-100"}, {"sku": "B-200"}]).encode("utf-16")
+
+    elements = partition_json(file=io.BytesIO(payload), encoding="utf-16")
+
+    assert len(elements) == 2
+    assert '"sku": "A-100"' in elements[0].text
+
+
+def it_detects_the_encoding_of_a_non_utf8_file_when_none_is_specified():
+    payload = json.dumps([{"sku": "A-100"}]).encode("utf-16")
+
+    elements = partition_json(file=io.BytesIO(payload))
+
+    assert len(elements) == 1
+    assert '"sku": "A-100"' in elements[0].text
+
+
+# -- valid UTF-8 must survive detection ------------------------------------------------------------
+
+# A run of zero-width spaces is valid UTF-8 that `charset_normalizer.detect()` reports as CP932
+# with high confidence. Decoding it that way still yields parseable JSON, so a detection-first
+# reader would silently replace the text instead of failing -- assert the exact string, because an
+# ASCII-only assertion passes straight through the corruption.
+_ZWS_TEXT = "A\u200bB\u200bC\u200bD\u200bE\u200bF\u200bG\u200bH"
+_ZWS_ELEMENT = {
+    "type": "NarrativeText",
+    "element_id": "eb2b8e2b7f8f4f0f9e0e1a2b3c4d5e6f",
+    "text": _ZWS_TEXT,
+    "metadata": {},
+}
+
+
+def it_preserves_valid_utf8_that_detection_would_read_as_another_codec():
+    payload = json.dumps([_ZWS_ELEMENT], ensure_ascii=False).encode("utf-8")
+
+    elements = partition_json(file=io.BytesIO(payload))
+
+    assert elements[0].text == _ZWS_TEXT
+
+
+def and_it_preserves_that_text_when_reading_from_a_filename_too():
+    payload = json.dumps([_ZWS_ELEMENT], ensure_ascii=False).encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "zws.json")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        elements = partition_json(filename=path)
+
+    assert elements[0].text == _ZWS_TEXT
+
+
+# -- the file-like contract ------------------------------------------------------------------------
+
+
+def it_accepts_a_text_stream_and_passes_the_decoded_string_through():
+    elements = partition_json(file=io.StringIO(json.dumps([_ZWS_ELEMENT], ensure_ascii=False)))
+
+    assert elements[0].text == _ZWS_TEXT
+
+
+def it_reads_a_binary_stream_from_its_current_position():
+    payload = json.dumps([_ZWS_ELEMENT], ensure_ascii=False).encode("utf-8")
+    stream = io.BytesIO(b"leading-bytes" + payload)
+    stream.seek(len(b"leading-bytes"))
+
+    elements = partition_json(file=stream)
+
+    assert elements[0].text == _ZWS_TEXT
+
+
+def it_accepts_a_temporary_file_wrapper():
+    payload = json.dumps([_ZWS_ELEMENT], ensure_ascii=False).encode("utf-8")
+    with tempfile.TemporaryFile() as f:
+        f.write(payload)
+        f.seek(0)
+
+        elements = partition_json(file=f)
+
+    assert elements[0].text == _ZWS_TEXT
+
+
+# -- positional-argument compatibility ---------------------------------------------------------
+
+
+def it_keeps_metadata_last_modified_as_the_fourth_positional_argument():
+    # -- inserting a parameter ahead of `metadata_last_modified` would silently rebind existing
+    # -- four-positional-argument calls --
+    elements = partition_json(None, None, json.dumps([_ZWS_ELEMENT]), "2020-01-02T03:04:05")
+
+    assert elements[0].metadata.last_modified == "2020-01-02T03:04:05"
+
+
+@pytest.mark.parametrize("strategy", [None, "basic", "by_title"])
+@pytest.mark.parametrize("stored", [True, False])
+@pytest.mark.parametrize("override", [None, "", "new"])
+def test_rehydration_applies_explicit_url_and_html_overrides(strategy, stored, override):
+    metadata = ElementMetadata(
+        url="old" if stored else None,
+        text_as_html="old" if stored else None,
+        filename="original.txt",
+        filetype="text/plain",
+    )
+    original = Text("content", element_id="stored-id", metadata=metadata)
+    result = partition_json(
+        text=json.dumps(elements_to_dicts([original])),
+        chunking_strategy=strategy,
+        url=override,
+        text_as_html=override,
+    )[0]
+    expected = override if override is not None else ("old" if stored else None)
+    assert result.metadata.url == expected
+    assert result.metadata.text_as_html == expected
+    assert result.metadata.filename == "original.txt"
+    assert result.metadata.filetype == "text/plain"
+    if strategy is None:
+        assert result.id == "stored-id"
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_json_custom_chunker_preserves_attachment_metadata(serialized):
+    def emit_attachment(elements: Iterable[Element], **kwargs) -> list[Element]:
+        return [
+            Text("ordinary"),
+            Text(
+                "attachment",
+                metadata=ElementMetadata(
+                    filename="invoice.pdf",
+                    filetype="application/pdf",
+                    attached_to_filename="message.eml",
+                    url="attachment-url",
+                    text_as_html="attachment-html",
+                ),
+            ),
+        ]
+
+    register_chunking_strategy("json-attachment-regression", emit_attachment)
+    text = json.dumps(elements_to_dicts([Text("original")])) if serialized else "{}"
+    ordinary, attachment = partition_json(
+        text=text,
+        chunking_strategy="json-attachment-regression",
+        metadata_filename="container.json",
+        url="container-url",
+        text_as_html="container-html",
+    )
+    assert ordinary.metadata.filename == "container.json"
+    assert ordinary.metadata.url == "container-url"
+    assert ordinary.metadata.text_as_html == "container-html"
+    assert attachment.metadata.filename == "invoice.pdf"
+    assert attachment.metadata.filetype == "application/pdf"
+    assert attachment.metadata.attached_to_filename == "message.eml"
+    assert attachment.metadata.url == "attachment-url"
+    assert attachment.metadata.text_as_html == "attachment-html"
+
+
+@pytest.mark.parametrize(
+    "route", ["empty", "empty_filename", "whitespace", "stream", "path", "array"]
+)
+@pytest.mark.parametrize("unique", [False, True])
+def test_empty_json_custom_chunker_receives_final_metadata_and_ids(route, unique, tmp_path):
+    def placeholder(elements: Iterable[Element], **kwargs) -> list[Element]:
+        assert list(elements) == []
+        return [CompositeElement("placeholder", element_id="placeholder-id")]
+
+    register_chunking_strategy("json-empty-regression", placeholder)
+    if route == "empty_filename":
+        arguments = {"filename": "", "text": " \n"}
+    elif route == "stream":
+        arguments = {"file": io.BytesIO(b" \n")}
+    elif route == "path":
+        path = tmp_path / "empty.json"
+        path.write_text(" \n")
+        arguments = {"filename": str(path)}
+    else:
+        arguments = {"text": {"empty": "", "whitespace": " \n", "array": "[]"}[route]}
+    result = partition_json(
+        **arguments,
+        chunking_strategy="json-empty-regression",
+        unique_element_ids=unique,
+        metadata_filename="container.json",
+        url="source-url",
+        text_as_html="source-html",
+    )[0]
+    assert result.metadata.filename == "container.json"
+    assert result.metadata.filetype == FileType.JSON.mime_type
+    assert result.metadata.url == "source-url"
+    assert result.metadata.text_as_html == "source-html"
+    assert (result.id == "placeholder-id") is unique
+
+
+@pytest.mark.parametrize("text", ["", " \n"])
+def test_blank_json_text_with_empty_filename_is_empty(text):
+    assert partition_json(filename="", text=text) == []

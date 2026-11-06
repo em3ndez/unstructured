@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import contextlib
-from typing import IO, Optional
+from typing import IO, Any, Optional, Sequence
 
 import requests
 from unstructured_client import UnstructuredClient
-from unstructured_client.models import shared
+from unstructured_client.models import operations, shared
+from unstructured_client.utils import retries
 
 from unstructured.documents.elements import Element
 from unstructured.logger import logger
-from unstructured.partition.common import exactly_one
+from unstructured.partition.common.common import exactly_one
 from unstructured.staging.base import elements_from_dicts, elements_from_json
+from unstructured.telemetry import partition_runtime_telemetry
+
+# Default retry configuration taken from the client code
+DEFAULT_RETRIES_INITIAL_INTERVAL_SEC = 3000
+DEFAULT_RETRIES_MAX_INTERVAL_SEC = 720000
+DEFAULT_RETRIES_EXPONENT = 1.5
+DEFAULT_RETRIES_MAX_ELAPSED_TIME_SEC = 1800000
+DEFAULT_RETRIES_CONNECTION_ERRORS = True
 
 
+@partition_runtime_telemetry()
 def partition_via_api(
     filename: Optional[str] = None,
     content_type: Optional[str] = None,
@@ -21,7 +31,12 @@ def partition_via_api(
     api_url: str = "https://api.unstructured.io/general/v0/general",
     api_key: str = "",
     metadata_filename: Optional[str] = None,
-    **request_kwargs,
+    retries_initial_interval: [int] = None,
+    retries_max_interval: Optional[int] = None,
+    retries_exponent: Optional[float] = None,
+    retries_max_elapsed_time: Optional[int] = None,
+    retries_connection_errors: Optional[bool] = None,
+    **request_kwargs: Any,
 ) -> list[Element]:
     """Partitions a document using the Unstructured REST API. This is equivalent to
     running the document through partition.
@@ -44,6 +59,21 @@ def partition_via_api(
         The URL for the Unstructured API. Defaults to the hosted Unstructured API.
     api_key
         The API key to pass to the Unstructured API.
+    retries_initial_interval
+        Defines the time interval (in seconds) to wait before the first retry in case of a request
+        failure. Defaults to 3000. If set should be > 0.
+    retries_max_interval
+        Defines the maximum time interval (in seconds) to wait between retries (the interval
+        between retries is increased as using exponential increase algorithm
+        - this setting limits it). Defaults to 720000. If set should be > 0.
+    retries_exponent
+        Defines the exponential factor to increase the interval between retries. Defaults to 1.5.
+        If set should be > 0.0.
+    retries_max_elapsed_time
+        Defines the maximum time (in seconds) to wait for retries. If exceeded, the original
+        exception is raised. Defaults to 1800000. If set should be > 0.
+    retries_connection_errors
+        Defines whether to retry on connection errors. Defaults to True.
     request_kwargs
         Additional parameters to pass to the data field of the request to the Unstructured API.
         For example the `strategy` parameter.
@@ -58,7 +88,7 @@ def partition_via_api(
 
     if file_filename is not None:
         metadata_filename = file_filename
-        logger.warn(
+        logger.warning(
             "The file_filename kwarg will be deprecated in a future version of unstructured. "
             "Please use metadata_filename instead.",
         )
@@ -83,8 +113,23 @@ def partition_via_api(
             )
         files = shared.Files(content=file, file_name=metadata_filename)
 
-    req = shared.PartitionParameters(files=files, **request_kwargs)
-    response = sdk.general.partition(req)
+    req = operations.PartitionRequest(
+        partition_parameters=shared.PartitionParameters(files=files, **request_kwargs)
+    )
+
+    retries_config = get_retries_config(
+        retries_connection_errors=retries_connection_errors,
+        retries_exponent=retries_exponent,
+        retries_initial_interval=retries_initial_interval,
+        retries_max_elapsed_time=retries_max_elapsed_time,
+        retries_max_interval=retries_max_interval,
+        sdk=sdk,
+    )
+
+    response = sdk.general.partition(
+        request=req,
+        retries=retries_config,
+    )
 
     if response.status_code == 200:
         return elements_from_json(text=response.raw_response.text)
@@ -94,15 +139,108 @@ def partition_via_api(
         )
 
 
+def get_retries_config(
+    retries_connection_errors: Optional[bool],
+    retries_exponent: Optional[float],
+    retries_initial_interval: Optional[int],
+    retries_max_elapsed_time: Optional[int],
+    retries_max_interval: Optional[int],
+    sdk: UnstructuredClient,
+) -> Optional[retries.RetryConfig]:
+    """Constructs a RetryConfig object from the provided parameters. If any of the parameters
+    are None, the default values are taken from the SDK configuration or the default constants.
+
+    If all parameters are None, returns None (and the SDK-managed defaults are used within the
+    client)
+
+    The solution is not perfect as the RetryConfig object does not include the defaults by
+    itself so we might need to construct it basing on our defaults.
+
+    Parameters
+    ----------
+    retries_connection_errors
+        Defines whether to retry on connection errors. If not set the
+        DEFAULT_RETRIES_CONNECTION_ERRORS constant is used.
+    retries_exponent
+        Defines the exponential factor to increase the interval between retries.
+        If set, should be > 0.0 (otherwise the DEFAULT_RETRIES_EXPONENT constant is used)
+    retries_initial_interval
+        Defines the time interval to wait before the first retry in case of a request failure.
+        If set, should be > 0 (otherwise the DEFAULT_RETRIES_INITIAL_INTERVAL_SEC constant is used)
+    retries_max_elapsed_time
+        Defines the maximum time to wait for retries. If exceeded, the original exception is raised.
+        If set, should be > 0 (otherwise the DEFAULT_RETRIES_MAX_ELAPSED_TIME_SEC constant is used)
+    retries_max_interval
+        Defines the maximum time interval to wait between retries. If set, should be > 0
+        (otherwise the DEFAULT_RETRIES_MAX_INTERVAL_SEC constant is used)
+    sdk
+        The UnstructuredClient object to take the default values from.
+    """
+    retries_config = None
+    sdk_default_retries_config = sdk.sdk_configuration.retry_config
+    if any(
+        setting is not None
+        for setting in (
+            retries_initial_interval,
+            retries_max_interval,
+            retries_exponent,
+            retries_max_elapsed_time,
+            retries_connection_errors,
+        )
+    ):
+
+        def get_backoff_default(setting_name: str, default_value: Any) -> Any:
+            if sdk_default_retries_config:  # noqa: SIM102
+                if setting_value := getattr(sdk_default_retries_config.backoff, setting_name):
+                    return setting_value
+            return default_value
+
+        default_retries_connneciton_errors = (
+            sdk_default_retries_config.retry_connection_errors
+            if sdk_default_retries_config
+            and sdk_default_retries_config.retry_connection_errors is not None
+            else DEFAULT_RETRIES_CONNECTION_ERRORS
+        )
+
+        backoff_strategy = retries.BackoffStrategy(
+            initial_interval=(
+                retries_initial_interval
+                or get_backoff_default("initial_interval", DEFAULT_RETRIES_INITIAL_INTERVAL_SEC)
+            ),
+            max_interval=(
+                retries_max_interval
+                or get_backoff_default("max_interval", DEFAULT_RETRIES_MAX_INTERVAL_SEC)
+            ),
+            exponent=(
+                retries_exponent or get_backoff_default("exponent", DEFAULT_RETRIES_EXPONENT)
+            ),
+            max_elapsed_time=(
+                retries_max_elapsed_time
+                or get_backoff_default("max_elapsed_time", DEFAULT_RETRIES_MAX_ELAPSED_TIME_SEC)
+            ),
+        )
+        retries_config = retries.RetryConfig(
+            strategy="backoff",
+            backoff=backoff_strategy,
+            retry_connection_errors=(
+                retries_connection_errors
+                if retries_connection_errors is not None
+                else default_retries_connneciton_errors
+            ),
+        )
+    return retries_config
+
+
+@partition_runtime_telemetry()
 def partition_multiple_via_api(
     filenames: Optional[list[str]] = None,
     content_types: Optional[list[str]] = None,
-    files: Optional[list[str]] = None,
+    files: Optional[Sequence[IO[bytes]]] = None,
     file_filenames: Optional[list[str]] = None,
     api_url: str = "https://api.unstructured.io/general/v0/general",
     api_key: str = "",
     metadata_filenames: Optional[list[str]] = None,
-    **request_kwargs,
+    **request_kwargs: Any,
 ) -> list[list[Element]]:
     """Partitions multiple documents using the Unstructured REST API by batching
     the documents into a single HTTP request.
@@ -142,7 +280,7 @@ def partition_multiple_via_api(
 
     if file_filenames is not None:
         metadata_filenames = file_filenames
-        logger.warn(
+        logger.warning(
             "The file_filenames kwarg will be deprecated in a future version of unstructured. "
             "Please use metadata_filenames instead.",
         )

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import pathlib
 import re
 import tempfile
@@ -14,6 +15,13 @@ from typing import Any, Iterator
 import docx
 import pytest
 from docx.document import Document
+from docx.enum.section import WD_SECTION
+from docx.enum.style import WD_STYLE_TYPE
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls, qn
+from docx.parts.document import DocumentPart
+from docx.section import Section
+from docx.styles.style import _CharacterStyle
 from docx.text.paragraph import Paragraph
 from pytest_mock import MockFixture
 
@@ -77,14 +85,15 @@ def test_partition_docx_with_spooled_file(
     `python-docx` will NOT accept a `SpooledTemporaryFile` in Python versions before 3.11 so we need
     to ensure the source file is appropriately converted in this case.
     """
-    with open(mock_document_file_path, "rb") as test_file:
-        spooled_temp_file = tempfile.SpooledTemporaryFile()
-        spooled_temp_file.write(test_file.read())
+    with tempfile.SpooledTemporaryFile() as spooled_temp_file:
+        with open(mock_document_file_path, "rb") as test_file:
+            spooled_temp_file.write(test_file.read())
         spooled_temp_file.seek(0)
+
         elements = partition_docx(file=spooled_temp_file)
-        assert elements == expected_elements
-        for element in elements:
-            assert element.metadata.filename is None
+
+    assert elements == expected_elements
+    assert all(e.metadata.filename is None for e in elements)
 
 
 def test_partition_docx_from_file(mock_document_file_path: str, expected_elements: list[Text]):
@@ -140,16 +149,140 @@ def test_partition_docx_processes_table():
     assert isinstance(elements[0], Table)
     assert elements[0].text == ("Header Col 1 Header Col 2 Lorem ipsum A Link example")
     assert elements[0].metadata.text_as_html == (
-        "<table>\n"
-        "<thead>\n"
-        "<tr><th>Header Col 1   </th><th>Header Col 2  </th></tr>\n"
-        "</thead>\n"
-        "<tbody>\n"
-        "<tr><td>Lorem ipsum    </td><td>A Link example</td></tr>\n"
-        "</tbody>\n"
+        "<table>"
+        "<tr><td>Header Col 1</td><td>Header Col 2</td></tr>"
+        "<tr><td>Lorem ipsum</td><td>A Link example</td></tr>"
         "</table>"
     )
     assert elements[0].metadata.filename == "fake_table.docx"
+
+
+def test_partition_docx_table_with_merged_cells_reports_spans_instead_of_duplicating_text():
+    """A merged cell's text must appear in exactly one `<td>`, marked with colspan/rowspan.
+
+    Fixture table is:
+
+        +---+-------+
+        | a | b     |
+        |   +---+---+
+        |   | c | d |
+        +---+---+   |
+        | e     |   |
+        +-------+---+
+    """
+    elements = partition_docx(example_doc_path("docx-tables.docx"), infer_table_structure=True)
+    tables = [e for e in elements if isinstance(e, Table)]
+    table = next(t for t in tables if t.text == "a b c d e")
+
+    assert table.metadata.text_as_html == (
+        "<table>"
+        '<tr><td rowspan="2">a</td><td colspan="2">b</td></tr>'
+        '<tr><td>c</td><td rowspan="2">d</td></tr>'
+        '<tr><td colspan="2">e</td></tr>'
+        "</table>"
+    )
+    # -- no cell's text is duplicated across more than one `<td>` --
+    for letter in "abcde":
+        assert table.metadata.text_as_html.count(f">{letter}<") == 1
+
+
+def test_partition_docx_table_with_full_width_vertical_merge_reports_a_tr_for_every_row(tmp_path):
+    """A grid-row entirely covered by a `rowspan` (no originating cells of its own) still needs
+    its own `<tr>` in the output. HTML `rowspan` counts actual `<tr>` elements, not "rows that
+    happened to have content" -- suppressing this row would shift the column-placement of every
+    row after it.
+
+        +---+
+        | A |
+        |   |
+        +---+
+        | B |
+        +---+
+    """
+    document = docx.Document()
+    table = document.add_table(rows=3, cols=1)
+    table.cell(0, 0).merge(table.cell(1, 0)).text = "A"
+    table.cell(2, 0).text = "B"
+    docx_path = tmp_path / "vertical-merge.docx"
+    document.save(str(docx_path))
+
+    elements = partition_docx(str(docx_path), infer_table_structure=True)
+    table_element = next(e for e in elements if isinstance(e, Table))
+
+    assert table_element.metadata.text_as_html == (
+        '<table><tr><td rowspan="2">A</td></tr><tr></tr><tr><td>B</td></tr></table>'
+    )
+
+
+def test_partition_docx_table_with_merged_cell_in_nested_table_does_not_duplicate_its_text(
+    tmp_path,
+):
+    """A merged cell in a table nested inside another table's cell contributes its text once.
+
+    Nested tables are flattened to plain text rather than nested `<table>` HTML, but that
+    flattening must still collapse a merged cell to a single occurrence of its text.
+    """
+    document = docx.Document()
+    outer_table = document.add_table(rows=1, cols=1)
+    nested_table = outer_table.cell(0, 0).add_table(rows=2, cols=2)
+    nested_table.cell(0, 0).merge(nested_table.cell(0, 1)).text = "MERGEDNESTED"
+    nested_table.cell(1, 0).text = "foo"
+    nested_table.cell(1, 1).text = "bar"
+    docx_path = tmp_path / "nested-merged-cell.docx"
+    document.save(str(docx_path))
+
+    elements = partition_docx(str(docx_path), infer_table_structure=True)
+    table_element = next(e for e in elements if isinstance(e, Table))
+
+    assert table_element.text == "MERGEDNESTED foo bar"
+    assert table_element.metadata.text_as_html == (
+        "<table><tr><td>MERGEDNESTED foo bar</td></tr></table>"
+    )
+
+
+def test_partition_docx_merged_cell_table_chunks_without_corrupting_rowspan_geometry(tmp_path):
+    """A DOCX table with a real vertical merge, partitioned then chunked with a small window,
+    must never split between rows an active `rowspan` still covers without correcting for it --
+    doing so would leave a continuation `TableChunk` with cells shifted into the wrong column.
+    Splitting is fine as long as the covering cell's `rowspan` is rewritten to match, and
+    re-materialized in whichever fragment doesn't hold the row that originally declared it."""
+    document = docx.Document()
+    table = document.add_table(rows=4, cols=2)
+    table.cell(0, 0).merge(table.cell(1, 0)).merge(table.cell(2, 0)).text = "REGIONWIDE TOTAL"
+    table.cell(0, 1).text = "alpha bravo charlie"
+    table.cell(1, 1).text = "delta echo foxtrot"
+    table.cell(2, 1).text = "golf hotel india"
+    table.cell(3, 0).text = "juliet"
+    table.cell(3, 1).text = "kilo lima mike"
+    docx_path = tmp_path / "merged-cell-chunking.docx"
+    document.save(str(docx_path))
+
+    elements = partition_docx(str(docx_path), infer_table_structure=True)
+    table_element = next(e for e in elements if isinstance(e, Table))
+    assert 'rowspan="3"' in table_element.metadata.text_as_html
+
+    chunks = chunk_by_title([table_element], max_characters=60)
+
+    assert len(chunks) == 3, "fixture should be oversized enough to actually require a split"
+    assert all(isinstance(chunk, TableChunk) for chunk in chunks)
+    assert all(len(chunk.text) <= 60 for chunk in chunks)
+    # -- the rowspan-3 group is itself too big for the window, so it's split on a row boundary;
+    # -- the covering cell's rowspan is rewritten to the rows present in the first fragment --
+    assert chunks[0].metadata.text_as_html == (
+        "<table>"
+        '<tr><td rowspan="2">REGIONWIDE TOTAL</td><td>alpha bravo charlie</td></tr>'
+        "<tr><td>delta echo foxtrot</td></tr>"
+        "</table>"
+    )
+    # -- the covering cell is re-materialized (rowspan="1") in the next fragment, which doesn't
+    # -- include the row that originally declared the span, keeping columns aligned --
+    assert chunks[1].metadata.text_as_html == (
+        "<table><tr><td>REGIONWIDE TOTAL</td><td>golf hotel india</td></tr></table>"
+    )
+    # -- the final row lands in its own chunk with both its cells correctly positioned --
+    assert chunks[2].metadata.text_as_html == (
+        "<table><tr><td>juliet</td><td>kilo lima mike</td></tr></table>"
+    )
 
 
 def test_partition_docx_grabs_header_and_footer():
@@ -209,25 +342,1353 @@ def test_partition_docx_detects_lists():
     elements = partition_docx(example_doc_path("example-list-items-multiple.docx"))
 
     assert elements[-1] == ListItem(
-        "This is simply dummy text of the printing and typesetting industry.",
+        "(a) This is simply dummy text of the printing and typesetting industry.",
     )
     assert sum(1 for e in elements if isinstance(e, ListItem)) == 10
 
 
-# -- `include_metadata` arg ----------------------------------------------------------------------
+# -- auto-numbered list labels -------------------------------------------------------------------
+
+_W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
 
 
-def test_partition_docx_from_filename_excludes_metadata_when_so_instructed():
-    elements = partition_docx(example_doc_path("handbook-1p.docx"), include_metadata=False)
-    assert all(e.metadata.to_dict() == {} for e in elements)
+_SEQ_COMPLEX = (
+    '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+    '<w:r><w:instrText xml:space="preserve"> SEQ Table \\* ARABIC </w:instrText></w:r>'
+    '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+    "<w:r><w:t>2</w:t></w:r>"
+    '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+)
+_SEQ_SIMPLE = '<w:fldSimple w:instr=" SEQ Table \\* ARABIC "><w:r><w:t>2</w:t></w:r></w:fldSimple>'
 
 
-def test_partition_docx_from_file_excludes_metadata_when_so_instructed():
-    with open(example_doc_path("simple.docx"), "rb") as f:
-        assert all(
-            element.metadata.to_dict() == {}
-            for element in partition_docx(file=f, include_metadata=False)
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        _SEQ_SIMPLE,
+        _SEQ_COMPLEX,
+        f'<w:ins w:id="1" w:author="a">{_SEQ_SIMPLE}</w:ins>',
+        f'<w:ins w:id="1" w:author="a">{_SEQ_COMPLEX}</w:ins>',
+        f'<w:smartTag w:uri="u" w:element="e">{_SEQ_COMPLEX}</w:smartTag>',
+        f"<w:sdt><w:sdtContent>{_SEQ_COMPLEX}</w:sdtContent></w:sdt>",
+        f'<w:hyperlink w:anchor="t2">{_SEQ_SIMPLE}</w:hyperlink>',
+    ],
+)
+def test_partition_docx_keeps_the_number_of_a_caption_field_however_it_is_wrapped(
+    tmp_path, wrapped: str
+):
+    path = str(tmp_path / "caption.docx")
+    document = docx.Document()
+    paragraph = document.add_paragraph()
+    for child in parse_xml(
+        f'<w:p {_W_NS}><w:r><w:t xml:space="preserve">Table </w:t></w:r>{wrapped}'
+        "<w:r><w:t>: Puppy Naps</w:t></w:r></w:p>"
+    ):
+        paragraph._p.append(child)
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    assert element.text == "Table 2: Puppy Naps"
+
+
+def test_partition_docx_does_not_include_text_from_a_text_box_in_the_paragraph_text(tmp_path):
+    path = str(tmp_path / "text_box.docx")
+    document = docx.Document()
+    paragraph = document.add_paragraph("Fetch ")
+    paragraph._p.append(
+        parse_xml(
+            f"<w:r {_W_NS}><w:pict><w:txbxContent><w:p><w:r><w:t>squirrel</w:t></w:r></w:p>"
+            "</w:txbxContent></w:pict></w:r>"
         )
+    )
+    paragraph.add_run("stick")
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    assert element.text == "Fetch stick"
+
+
+def _docx_with_body_xml(tmp_path, *body_xml: str) -> str:
+    path = str(tmp_path / "nested.docx")
+    document = docx.Document()
+    for xml in body_xml:
+        document.element.body.insert(len(document.element.body) - 1, parse_xml(xml))
+    document.save(path)
+    return path
+
+
+def _p(inner: str) -> str:
+    return f"<w:p {_W_NS}>{inner}</w:p>"
+
+
+def _r(text: str) -> str:
+    return f"<w:r><w:t>{text}</w:t></w:r>"
+
+
+@pytest.mark.parametrize(
+    ("body_xml", "expected"),
+    [
+        (
+            f"<w:sdt {_W_NS}><w:sdtContent>{_p(_r('puppy in a box'))}</w:sdtContent></w:sdt>",
+            "puppy in a box",
+        ),
+        (
+            f'<w:customXml {_W_NS} w:element="e">{_p(_r("puppy in custom xml"))}</w:customXml>',
+            "puppy in custom xml",
+        ),
+        (
+            _p(f'{_r("wag")}<w:ins w:id="1" w:author="x">{_r("wiggle")}</w:ins>{_r("woof")}'),
+            "wagwigglewoof",
+        ),
+        (
+            _p(
+                f'{_r("wag")}<w:moveTo w:id="1" w:author="x">{_r("wiggle")}</w:moveTo>'
+                f'<w:moveFrom w:id="2" w:author="x"><w:r><w:delText>wiggle</w:delText></w:r>'
+                f"</w:moveFrom>{_r('woof')}"
+            ),
+            "wagwigglewoof",
+        ),
+        (
+            _p(f'{_r("wag")}<w:smartTag w:uri="u" w:element="e">{_r("wiggle")}</w:smartTag>'),
+            "wagwiggle",
+        ),
+        (
+            _p(
+                f'{_r("wag")}<w:customXml w:element="e"><w:customXmlPr/>'
+                f"{_r('wiggle')}</w:customXml>"
+            ),
+            "wagwiggle",
+        ),
+        (_p(f'{_r("wag")}<w:bdo w:val="ltr">{_r("wiggle")}</w:bdo>{_r("woof")}'), "wagwigglewoof"),
+    ],
+)
+def test_partition_docx_reads_content_wrapped_in_elements_python_docx_skips(
+    tmp_path, body_xml: str, expected: str
+):
+    (element,) = partition_docx(_docx_with_body_xml(tmp_path, body_xml))
+
+    assert element.text == expected
+
+
+def test_partition_docx_leaves_out_deleted_text_including_a_deleted_tab_or_line_break(tmp_path):
+    path = _docx_with_body_xml(
+        tmp_path,
+        _p(
+            f'{_r("wag")}<w:del w:id="1" w:author="x"><w:r><w:tab/><w:br/>'
+            f"<w:delText>chewed slipper</w:delText></w:r></w:del>{_r('wiggle')}"
+        ),
+    )
+
+    (element,) = partition_docx(path)
+
+    assert element.text == "wagwiggle"
+
+
+def test_partition_docx_leaves_out_a_content_control_that_only_shows_its_placeholder(tmp_path):
+    path = _docx_with_body_xml(
+        tmp_path,
+        _p(
+            f"{_r('Puppy name: ')}<w:sdt><w:sdtPr><w:showingPlcHdr/></w:sdtPr><w:sdtContent>"
+            f"{_r('Type a puppy name here')}</w:sdtContent></w:sdt>"
+        ),
+    )
+
+    (element,) = partition_docx(path)
+
+    assert element.text == "Puppy name: "
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("<w:showingPlcHdr/>", "Puppy name: "),
+        ('<w:showingPlcHdr w:val="1"/>', "Puppy name: "),
+        ('<w:showingPlcHdr w:val="true"/>', "Puppy name: "),
+        ('<w:showingPlcHdr w:val="on"/>', "Puppy name: "),
+        ('<w:showingPlcHdr w:val="0"/>', "Puppy name: Rex"),
+        ('<w:showingPlcHdr w:val="false"/>', "Puppy name: Rex"),
+        ('<w:showingPlcHdr w:val="off"/>', "Puppy name: Rex"),
+    ],
+)
+def test_partition_docx_drops_a_content_control_only_when_its_placeholder_flag_is_on(
+    tmp_path, flag: str, expected: str
+):
+    path = _docx_with_body_xml(
+        tmp_path,
+        _p(
+            f"{_r('Puppy name: ')}<w:sdt><w:sdtPr>{flag}</w:sdtPr><w:sdtContent>{_r('Rex')}"
+            "</w:sdtContent></w:sdt>"
+        ),
+    )
+
+    (element,) = partition_docx(path)
+
+    assert element.text == expected
+
+
+def test_partition_docx_leaves_the_automatic_table_of_contents_unread(tmp_path):
+    toc = (
+        f'<w:sdt {_W_NS}><w:sdtPr><w:docPartObj><w:docPartGallery w:val="Table of Contents"/>'
+        f"</w:docPartObj></w:sdtPr><w:sdtContent>{_p(_r('1. Treats ..... 3'))}</w:sdtContent>"
+        "</w:sdt>"
+    )
+    path = _docx_with_body_xml(tmp_path, toc, _p(_r("Good dog")))
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["Good dog"]
+
+
+def test_partition_docx_reads_a_table_whose_row_and_cell_are_wrapped_in_content_controls(
+    tmp_path,
+):
+    cell = f"<w:sdt><w:sdtContent><w:tc>{_p(_r('Fido'))}</w:tc></w:sdtContent></w:sdt>"
+    row = f"<w:tr><w:tc>{_p(_r('Rex'))}</w:tc>{cell}</w:tr>"
+    path = _docx_with_body_xml(
+        tmp_path,
+        f"<w:tbl {_W_NS}><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>"
+        f"<w:sdt><w:sdtContent>{row}</w:sdtContent></w:sdt></w:tbl>",
+    )
+
+    (table,) = partition_docx(path)
+
+    assert isinstance(table, Table)
+    assert table.text == "Rex Fido"
+    assert "<td>Fido</td>" in (table.metadata.text_as_html or "")
+
+
+def test_partition_docx_reads_a_content_control_in_a_header_and_a_footer(tmp_path):
+    path = str(tmp_path / "hf.docx")
+    document = docx.Document()
+    document.add_paragraph("Good dog")
+    section = document.sections[0]
+    for part, text in ((section.header, "zoomies"), (section.footer, "treats")):
+        paragraph = part.paragraphs[0]
+        paragraph._p.append(
+            parse_xml(
+                f"<w:sdt {_W_NS}><w:sdtContent><w:r><w:t>{text}</w:t></w:r></w:sdtContent></w:sdt>"
+            )
+        )
+    document.save(path)
+
+    texts = [e.text for e in partition_docx(path)]
+
+    assert "zoomies" in texts
+    assert "treats" in texts
+
+
+def _lvl_xml(ilvl: int, fmt: str, text: str, start: int = 1) -> str:
+    return (
+        f'<w:lvl w:ilvl="{ilvl}"><w:start w:val="{start}"/><w:numFmt w:val="{fmt}"/>'
+        f'<w:lvlText w:val="{text}"/></w:lvl>'
+    )
+
+
+def _numbered_docx(
+    tmp_path: pathlib.Path,
+    paragraphs: list[tuple[str, int | None, int]],
+    *,
+    numbering_xml: str | None = None,
+) -> str:
+    """Path of a DOCX whose numbering definitions are those in `numbering_xml`.
+
+    Each item of `paragraphs` is `(text, num_id, ilvl)`; `num_id=None` makes a plain paragraph.
+    Numbering definitions available by default:
+
+    - numId 1: multilevel list, levels `%1.` decimal, `%2)` lowerLetter, `%3.` lowerRoman
+    - numId 2: bullet list
+    - numId 3: same abstract definition as numId 1 but level 0 restarts at 5
+    - numId 4: same abstract definition as numId 1 with no override
+    - style "NumberedStyle" is bound to numId 1 and "ChildStyle" is based on it
+    - style "LinkedStyle" is bound to numId 1 at ilvl 0
+    - style "OutlinedStyle" is bound to numId 1 and has outline level 0, "OutlinedChildStyle" is
+      based on "OutlinedStyle", "OutlinedGrandchildStyle" is based on "OutlinedChildStyle",
+      "BodyOverChildStyle" is based on "OutlinedStyle" with outline level 9, and
+      "BodyOutlineStyle" is bound to numId 1 with outline level 9
+    """
+    numbering_xml = numbering_xml or (
+        f"<w:numbering {_W_NS}>"
+        '<w:abstractNum w:abstractNumId="0">'
+        + _lvl_xml(0, "decimal", "%1.")
+        + _lvl_xml(1, "lowerLetter", "%2)")
+        + _lvl_xml(2, "lowerRoman", "%3.")
+        + "</w:abstractNum>"
+        '<w:abstractNum w:abstractNumId="1">' + _lvl_xml(0, "bullet", "•") + "</w:abstractNum>"
+        '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
+        '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>'
+        '<w:num w:numId="3"><w:abstractNumId w:val="0"/>'
+        '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num>'
+        '<w:num w:numId="4"><w:abstractNumId w:val="0"/></w:num>'
+        "</w:numbering>"
+    )
+    document = docx.Document()
+    numbering = document.part.numbering_part.element
+    for child in list(numbering):
+        numbering.remove(child)
+    for child in parse_xml(numbering_xml):
+        numbering.append(child)
+    styles = document.styles.element
+    styles.append(
+        parse_xml(
+            f'<w:style {_W_NS} w:type="paragraph" w:styleId="NumberedStyle">'
+            '<w:name w:val="NumberedStyle"/><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>'
+            "</w:style>"
+        )
+    )
+    styles.append(
+        parse_xml(
+            f'<w:style {_W_NS} w:type="paragraph" w:styleId="ChildStyle">'
+            '<w:name w:val="ChildStyle"/><w:basedOn w:val="NumberedStyle"/></w:style>'
+        )
+    )
+    styles.append(
+        parse_xml(
+            f'<w:style {_W_NS} w:type="paragraph" w:styleId="LinkedStyle">'
+            '<w:name w:val="LinkedStyle"/><w:pPr><w:numPr><w:ilvl w:val="0"/>'
+            '<w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+        )
+    )
+    for style_id, based_on, outline in [
+        ("OutlinedStyle", None, 0),
+        ("OutlinedChildStyle", "OutlinedStyle", None),
+        ("OutlinedGrandchildStyle", "OutlinedChildStyle", None),
+        ("BodyOverChildStyle", "OutlinedStyle", 9),
+        ("BodyOutlineStyle", None, 9),
+    ]:
+        styles.append(
+            parse_xml(
+                f'<w:style {_W_NS} w:type="paragraph" w:styleId="{style_id}">'
+                f'<w:name w:val="{style_id}"/>'
+                + (f'<w:basedOn w:val="{based_on}"/>' if based_on else "")
+                + "<w:pPr>"
+                + ('<w:numPr><w:numId w:val="1"/></w:numPr>' if based_on is None else "")
+                + (f'<w:outlineLvl w:val="{outline}"/>' if outline is not None else "")
+                + "</w:pPr></w:style>"
+            )
+        )
+    for text, num_id, ilvl in paragraphs:
+        paragraph = document.add_paragraph(text)
+        if num_id is not None:
+            paragraph._p.get_or_add_pPr().append(
+                parse_xml(
+                    f'<w:numPr {_W_NS}><w:ilvl w:val="{ilvl}"/>'
+                    f'<w:numId w:val="{num_id}"/></w:numPr>'
+                )
+            )
+    path = tmp_path / "numbered.docx"
+    document.save(str(path))
+    return str(path)
+
+
+def test_partition_docx_prefixes_list_items_with_their_auto_numbered_labels(tmp_path):
+    path = _numbered_docx(tmp_path, [("alpha", 1, 0), ("beta", 1, 0), ("gamma", 1, 0)])
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [
+        (ListItem, "1. alpha"),
+        (ListItem, "2. beta"),
+        (ListItem, "3. gamma"),
+    ]
+
+
+def test_partition_docx_labels_nested_list_levels_and_restarts_deeper_levels(tmp_path):
+    path = _numbered_docx(
+        tmp_path,
+        [
+            ("top", 1, 0),
+            ("sub one", 1, 1),
+            ("sub two", 1, 1),
+            ("subsub", 1, 2),
+            ("top two", 1, 0),
+            ("sub again", 1, 1),
+        ],
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == [
+        "1. top",
+        "a) sub one",
+        "b) sub two",
+        "i. subsub",
+        "2. top two",
+        "a) sub again",
+    ]
+    assert [e.metadata.category_depth for e in elements] == [0, 1, 1, 2, 0, 1]
+
+
+def test_partition_docx_continues_counting_after_an_intervening_paragraph(tmp_path):
+    path = _numbered_docx(
+        tmp_path,
+        [("one", 1, 0), ("two", 1, 0), ("Some narrative text between the items.", None, 0)]
+        + [("three", 1, 0)],
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == [
+        "1. one",
+        "2. two",
+        "Some narrative text between the items.",
+        "3. three",
+    ]
+
+
+def test_partition_docx_starts_a_restarted_list_at_its_start_override(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("b", 1, 0), ("c", 3, 0), ("d", 3, 0)])
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "2. b", "5. c", "6. d"]
+
+
+def test_partition_docx_labels_list_items_that_inherit_numbering_from_their_style(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    for text, style in [("styled", "NumberedStyle"), ("inherited", "ChildStyle")]:
+        document.add_paragraph(text, style=style)
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [
+        (ListItem, "1. styled"),
+        (ListItem, "2. inherited"),
+    ]
+
+
+def test_partition_docx_looks_up_each_paragraph_style_once(tmp_path, mocker: MockFixture):
+    document = docx.Document()
+    for i in range(20):
+        document.add_paragraph(f"Paragraph {i} uses the default style.")
+        document.add_paragraph(f"Heading {i}", style="Heading 1")
+        document.add_paragraph(f"Item {i}", style="List Bullet")
+    path = str(tmp_path / "styles.docx")
+    document.save(path)
+    get_style = mocker.spy(DocumentPart, "get_style")
+
+    elements = partition_docx(path)
+
+    assert len(elements) == 60
+    # -- three style-ids, each looked up by the partitioner and by the list-label renderer,
+    # -- however many paragraphs use them --
+    assert get_style.call_count == 6
+
+
+def test_partition_docx_does_not_prefix_bulleted_list_items(tmp_path):
+    path = _numbered_docx(tmp_path, [("first", 2, 0), ("second", 2, 0)])
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "first"), (ListItem, "second")]
+
+
+def test_partition_docx_leaves_typed_in_numbers_unchanged(tmp_path):
+    path = _numbered_docx(tmp_path, [("1. alpha", None, 0), ("2. beta", None, 0)])
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. alpha", "2. beta"]
+
+
+@pytest.mark.parametrize(
+    ("num_fmt", "expected_labels"),
+    [
+        ("decimal", ["1.", "2.", "3.", "4."]),
+        ("lowerLetter", ["a.", "b.", "c.", "d."]),
+        ("upperLetter", ["A.", "B.", "C.", "D."]),
+        ("lowerRoman", ["i.", "ii.", "iii.", "iv."]),
+        ("upperRoman", ["I.", "II.", "III.", "IV."]),
+    ],
+)
+def test_partition_docx_formats_labels_by_number_format(
+    tmp_path, num_fmt: str, expected_labels: list[str]
+):
+    numbering_xml = (
+        f"<w:numbering {_W_NS}>"
+        '<w:abstractNum w:abstractNumId="0">' + _lvl_xml(0, num_fmt, "%1.") + "</w:abstractNum>"
+        '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
+        "</w:numbering>"
+    )
+    path = _numbered_docx(
+        tmp_path, [(f"item {n}", 1, 0) for n in range(4)], numbering_xml=numbering_xml
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == [
+        f"{label} item {n}" for n, label in enumerate(expected_labels)
+    ]
+
+
+def test_partition_docx_wraps_letter_labels_past_z(tmp_path):
+    numbering_xml = (
+        f"<w:numbering {_W_NS}>"
+        '<w:abstractNum w:abstractNumId="0">'
+        + _lvl_xml(0, "lowerLetter", "%1.", start=26)
+        + "</w:abstractNum>"
+        '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
+        "</w:numbering>"
+    )
+    path = _numbered_docx(tmp_path, [("x", 1, 0), ("y", 1, 0)], numbering_xml=numbering_xml)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["z. x", "aa. y"]
+
+
+@pytest.mark.parametrize(
+    ("num_fmt", "start", "expected_labels"),
+    [
+        ("lowerLetter", 27, ["aa", "bb", "cc"]),
+        ("lowerLetter", 52, ["zz", "aaa", "bbb"]),
+        ("upperLetter", 52, ["ZZ", "AAA", "BBB"]),
+    ],
+)
+def test_partition_docx_repeats_the_letter_rather_than_counting_in_base_26(
+    tmp_path, num_fmt: str, start: int, expected_labels: list[str]
+):
+    # -- Word numbers a, b, ... z, aa, bb, ... zz, aaa; not spreadsheet-style (aa, ab, ac) --
+    numbering_xml = _single_definition_numbering(_lvl_xml(0, num_fmt, "%1", start=start))
+    path = _numbered_docx(
+        tmp_path, [(f"item {n}", 1, 0) for n in range(3)], numbering_xml=numbering_xml
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == [
+        f"{label} item {n}" for n, label in enumerate(expected_labels)
+    ]
+
+
+def test_partition_docx_falls_back_to_plain_text_when_numbering_is_unresolvable(tmp_path):
+    numbering_xml = f"<w:numbering {_W_NS}/>"
+    path = _numbered_docx(tmp_path, [("orphan", 1, 0)], numbering_xml=numbering_xml)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "orphan")]
+
+
+def _single_definition_numbering(*levels: str) -> str:
+    """A numbering part whose only list, numId 1, has the given `w:lvl` definitions."""
+    return (
+        f"<w:numbering {_W_NS}>"
+        '<w:abstractNum w:abstractNumId="0">' + "".join(levels) + "</w:abstractNum>"
+        '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
+        "</w:numbering>"
+    )
+
+
+def test_partition_docx_continues_counting_across_num_ids_sharing_a_definition(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("b", 1, 0), ("c", 4, 0), ("d", 4, 0)])
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "2. b", "3. c", "4. d"]
+
+
+def test_partition_docx_continues_the_shared_count_after_a_start_override(tmp_path):
+    path = _numbered_docx(
+        tmp_path, [("a", 1, 0), ("b", 1, 0), ("c", 3, 0), ("d", 3, 0), ("e", 1, 0)]
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "2. b", "5. c", "6. d", "7. e"]
+
+
+def test_partition_docx_restarts_numbered_children_after_a_bullet_parent(tmp_path):
+    numbering_xml = _single_definition_numbering(
+        _lvl_xml(0, "bullet", "•"), _lvl_xml(1, "decimal", "%2.")
+    )
+    path = _numbered_docx(
+        tmp_path,
+        [("A", 1, 0), ("x", 1, 1), ("B", 1, 0), ("y", 1, 1)],
+        numbering_xml=numbering_xml,
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["A", "1. x", "B", "1. y"]
+
+
+def test_partition_docx_restarts_a_child_level_at_its_override_value_each_time(tmp_path):
+    numbering_xml = (
+        f"<w:numbering {_W_NS}>"
+        '<w:abstractNum w:abstractNumId="0">'
+        + _lvl_xml(0, "decimal", "%1.")
+        + _lvl_xml(1, "decimal", "%2.")
+        + "</w:abstractNum>"
+        '<w:num w:numId="1"><w:abstractNumId w:val="0"/>'
+        '<w:lvlOverride w:ilvl="1"><w:startOverride w:val="5"/></w:lvlOverride></w:num>'
+        "</w:numbering>"
+    )
+    path = _numbered_docx(
+        tmp_path,
+        [("P", 1, 0), ("x", 1, 1), ("x2", 1, 1), ("Q", 1, 0), ("y", 1, 1), ("y2", 1, 1)],
+        numbering_xml=numbering_xml,
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. P", "5. x", "6. x2", "2. Q", "5. y", "6. y2"]
+
+
+def test_partition_docx_resolves_each_paragraph_against_its_own_numbering_definition(tmp_path):
+    formats = ["decimal", "upperRoman", "lowerLetter"]
+    numbering_xml = (
+        f"<w:numbering {_W_NS}>"
+        + "".join(
+            f'<w:abstractNum w:abstractNumId="{n}">'
+            + _lvl_xml(0, formats[n % 3], "%1.")
+            + "</w:abstractNum>"
+            for n in range(300)
+        )
+        + "".join(
+            f'<w:num w:numId="{n + 1}"><w:abstractNumId w:val="{n}"/></w:num>' for n in range(300)
+        )
+        + "</w:numbering>"
+    )
+    path = _numbered_docx(
+        tmp_path, [(f"item {n}", n + 1, 0) for n in range(300)], numbering_xml=numbering_xml
+    )
+
+    elements = partition_docx(path)
+
+    expected_labels = {"decimal": "1.", "upperRoman": "I.", "lowerLetter": "a."}
+    assert [e.text for e in elements] == [
+        f"{expected_labels[formats[n % 3]]} item {n}" for n in range(300)
+    ]
+
+
+def test_partition_docx_uses_the_level_a_style_names_over_the_one_a_definition_links(tmp_path):
+    linked = _lvl_xml(1, "lowerLetter", "%2)").replace(
+        "<w:lvlText", '<w:pStyle w:val="LinkedStyle"/><w:lvlText'
+    )
+    numbering_xml = _single_definition_numbering(_lvl_xml(0, "decimal", "%1."), linked)
+    path = _numbered_docx(tmp_path, [], numbering_xml=numbering_xml)
+    document = docx.Document(path)
+    for text in ("one", "two"):
+        document.add_paragraph(text, style="LinkedStyle")
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. one", "2. two"]
+
+
+def _add_direct_num_pr(paragraph, num_id: int = 1, ilvl: int = 0) -> None:
+    paragraph._p.get_or_add_pPr().append(
+        parse_xml(f'<w:numPr {_W_NS}><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr>')
+    )
+
+
+@pytest.mark.parametrize(
+    "style", ["OutlinedStyle", "OutlinedChildStyle", "OutlinedGrandchildStyle"]
+)
+def test_partition_docx_labels_a_numbered_heading_without_making_it_a_list_item(
+    tmp_path, style: str
+):
+    path = _numbered_docx(tmp_path, [("a", 1, 0)])
+    document = docx.Document(path)
+    document.add_paragraph("Heading text", style=style)
+    _add_direct_num_pr(document.add_paragraph("c"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(isinstance(e, ListItem), e.text) for e in elements] == [
+        (True, "1. a"),
+        (False, "2. Heading text"),
+        (True, "3. c"),
+    ]
+
+
+def test_partition_docx_labels_a_numbered_heading_that_a_style_name_maps_to_a_title(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    heading_style = document.styles["Heading 1"].element
+    heading_style.get_or_add_pPr().append(
+        parse_xml(f'<w:numPr {_W_NS}><w:numId w:val="1"/></w:numPr>')
+    )
+    document.add_paragraph("Overview", style="Heading 1")
+    document.add_paragraph("Scope", style="Heading 1")
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(Title, "1. Overview"), (Title, "2. Scope")]
+
+
+def test_partition_docx_shifts_link_offsets_past_a_numbered_headings_label(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    heading = document.add_paragraph("", style="OutlinedStyle")
+    url_id = document.part.relate_to(
+        "https://example.com/",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+    heading._p.append(
+        parse_xml(
+            f'<w:hyperlink {_W_NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/'
+            f'relationships" r:id="{url_id}"><w:r><w:t>example</w:t></w:r></w:hyperlink>'
+        )
+    )
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    (link,) = element.metadata.links
+    assert not isinstance(element, ListItem)
+    assert element.text == "1. example"
+    assert element.text[link["start_index"] :][: len(link["text"])] == "example"
+
+
+def test_partition_docx_restarts_a_child_level_after_a_numbered_heading(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("x", 1, 2)])
+    document = docx.Document(path)
+    _add_direct_num_pr(document.add_paragraph("Heading text", style="OutlinedStyle"), ilvl=1)
+    _add_direct_num_pr(document.add_paragraph("c"), ilvl=2)
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(isinstance(e, ListItem), e.text) for e in elements] == [
+        (True, "1. a"),
+        (True, "i. x"),
+        (False, "a) Heading text"),
+        (True, "i. c"),
+    ]
+
+
+@pytest.mark.parametrize("style", ["Title", "Subtitle"])
+def test_partition_docx_labels_a_numbered_title_style_that_has_no_outline_level(
+    tmp_path, style: str
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    style_element = document.styles[style].element
+    for outline in style_element.xpath("./w:pPr/w:outlineLvl"):
+        outline.getparent().remove(outline)
+    _add_direct_num_pr(document.add_paragraph("Overview", style=style))
+    _add_direct_num_pr(document.add_paragraph("an item"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [
+        (Title, "1. Overview"),
+        (ListItem, "2. an item"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("level", "is_heading"), [("0", True), ("8", True), ("9", False), ("10", False)]
+)
+def test_partition_docx_treats_outline_levels_zero_to_eight_as_headings(
+    tmp_path, level: str, is_heading: bool
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    paragraph = document.add_paragraph("text")
+    _add_direct_num_pr(paragraph)
+    paragraph._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {_W_NS} w:val="{level}"/>'))
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    assert (isinstance(element, ListItem), element.text) == (not is_heading, "1. text")
+
+
+@pytest.mark.parametrize("style", ["List Paragraph", "List Number", "List Bullet"])
+def test_partition_docx_does_not_let_a_list_style_turn_a_numbered_heading_back_into_a_list_item(
+    tmp_path, style: str
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    paragraph = document.add_paragraph("Overview", style=style)
+    _add_direct_num_pr(paragraph)
+    paragraph._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {_W_NS} w:val="0"/>'))
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    assert (isinstance(element, ListItem), element.text) == (False, "1. Overview")
+
+
+def test_partition_docx_resolves_a_long_style_chain_in_linear_time(tmp_path, monkeypatch):
+    style_count = 60
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    previous = document.styles["OutlinedStyle"]
+    for n in range(style_count):
+        style = document.styles.add_style(f"Chain{n}", WD_STYLE_TYPE.PARAGRAPH)
+        style.base_style = previous
+        previous = style
+        _add_direct_num_pr(document.add_paragraph(f"heading {n}", style=f"Chain{n}"))
+    document.save(path)
+    hops = 0
+    in_lookup = False
+    base_style = _CharacterStyle.base_style
+    outline_lookup = _DocxPartitioner._style_has_outline_level
+
+    def counting_base_style(self):
+        nonlocal hops
+        hops += in_lookup
+        return base_style.fget(self)
+
+    def tracked_outline_lookup(self, style):
+        nonlocal in_lookup
+        in_lookup = True
+        try:
+            return outline_lookup(self, style)
+        finally:
+            in_lookup = False
+
+    monkeypatch.setattr(_CharacterStyle, "base_style", property(counting_base_style))
+    monkeypatch.setattr(_DocxPartitioner, "_style_has_outline_level", tracked_outline_lookup)
+
+    elements = partition_docx(path)
+
+    assert not any(isinstance(e, ListItem) for e in elements)
+    assert hops <= 3 * style_count
+
+
+def test_partition_docx_labels_a_numbered_paragraph_that_is_classified_by_its_text(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    document.add_paragraph("Short heading", style="OutlinedStyle")
+    document.add_paragraph(
+        "The committee reviewed the proposal and approved the budget for the coming year.",
+        style="OutlinedStyle",
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [
+        (Text, "1. Short heading"),
+        (
+            NarrativeText,
+            "2. The committee reviewed the proposal and approved the budget for the coming year.",
+        ),
+    ]
+
+
+def test_partition_docx_does_not_label_or_count_a_heading_that_turns_numbering_off(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0)])
+    document = docx.Document(path)
+    _add_direct_num_pr(document.add_paragraph("Unnumbered heading", style="Heading 1"), num_id=0)
+    _add_direct_num_pr(document.add_paragraph("c"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [
+        (ListItem, "1. a"),
+        (Title, "Unnumbered heading"),
+        (ListItem, "2. c"),
+    ]
+
+
+def test_partition_docx_labels_only_the_first_fragment_of_a_paragraph_split_by_a_page_break(
+    tmp_path,
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    paragraph = document.add_paragraph("", style="OutlinedStyle")
+    for run_xml in (
+        "<w:r %s><w:t>before</w:t></w:r>",
+        "<w:r %s><w:lastRenderedPageBreak/></w:r>",
+        "<w:r %s><w:t>after</w:t></w:r>",
+    ):
+        paragraph._p.append(parse_xml(run_xml % _W_NS))
+    _add_direct_num_pr(document.add_paragraph("next"))
+    document.save(path)
+
+    elements = [e for e in partition_docx(path) if not isinstance(e, PageBreak)]
+
+    assert [e.text for e in elements] == ["1. before", "after", "2. next"]
+
+
+def test_partition_docx_treats_a_directly_numbered_paragraph_in_an_outlined_style_as_a_heading(
+    tmp_path,
+):
+    path = _numbered_docx(tmp_path, [("a", 1, 0)])
+    document = docx.Document(path)
+    _add_direct_num_pr(document.add_paragraph("x", style="OutlinedStyle"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(isinstance(e, ListItem), e.text) for e in elements] == [
+        (True, "1. a"),
+        (False, "2. x"),
+    ]
+
+
+def test_partition_docx_treats_a_directly_numbered_heading_style_paragraph_as_a_title(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    _add_direct_num_pr(document.add_paragraph("Overview", style="Heading 1"))
+    _add_direct_num_pr(document.add_paragraph("Scope", style="Heading 1"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(Title, "1. Overview"), (Title, "2. Scope")]
+
+
+@pytest.mark.parametrize("style", ["Caption", "Quote", "No Spacing", "List Paragraph"])
+def test_partition_docx_keeps_a_directly_numbered_paragraph_in_a_non_heading_style_a_list_item(
+    tmp_path, style: str
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    _add_direct_num_pr(document.add_paragraph("item", style=style))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "1. item")]
+
+
+def test_partition_docx_uses_the_own_outline_level_of_a_directly_numbered_paragraph(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    for text, style, level in [
+        ("heading by paragraph", "Normal", 1),
+        ("list item by paragraph", "OutlinedStyle", 9),
+    ]:
+        paragraph = document.add_paragraph(text, style=style)
+        _add_direct_num_pr(paragraph)
+        paragraph._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {_W_NS} w:val="{level}"/>'))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(isinstance(e, ListItem), e.text) for e in elements] == [
+        (False, "1. heading by paragraph"),
+        (True, "2. list item by paragraph"),
+    ]
+
+
+def test_partition_docx_uses_the_paragraphs_own_outline_level_over_its_styles(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    for text, style, level in [
+        ("heading by paragraph", "NumberedStyle", 1),
+        ("list item by paragraph", "OutlinedStyle", 9),
+    ]:
+        paragraph = document.add_paragraph(text, style=style)
+        paragraph._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {_W_NS} w:val="{level}"/>'))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(isinstance(e, ListItem), e.text) for e in elements] == [
+        (False, "1. heading by paragraph"),
+        (True, "2. list item by paragraph"),
+    ]
+
+
+def test_partition_docx_lets_the_nearest_style_outline_level_decide(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    document.add_paragraph("body text", style="BodyOverChildStyle")
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "1. body text")]
+
+
+@pytest.mark.parametrize("level", ["x", "", "-1", "10"])
+def test_partition_docx_ignores_an_outline_level_outside_zero_to_eight(tmp_path, level: str):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    document.styles["BodyOutlineStyle"].element.xpath("./w:pPr/w:outlineLvl")[0].set(
+        qn("w:val"), level
+    )
+    document.add_paragraph("item", style="BodyOutlineStyle")
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "1. item")]
+
+
+def test_partition_docx_treats_a_numbered_body_text_outline_level_as_a_list_item(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    document.add_paragraph("body", style="BodyOutlineStyle")
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "1. body")]
+
+
+def test_partition_docx_still_numbers_a_section_break_paragraph_that_has_text(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("b", 1, 0), ("c", 1, 0)])
+    document = docx.Document(path)
+    document.paragraphs[1]._p.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "2. b", "3. c"]
+
+
+def test_partition_docx_counts_an_empty_numbered_paragraph(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("", 1, 0), ("c", 1, 0)])
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "3. c"]
+
+
+def test_partition_docx_does_not_count_an_empty_paragraph_that_holds_a_section_break(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("", 1, 0), ("c", 1, 0)])
+    document = docx.Document(path)
+    section_break = document.paragraphs[1]._p.get_or_add_pPr()
+    section_break.append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "2. c"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<w:drawing/>",
+        "<w:pict/>",
+        "<w:object/>",
+        "<w:tab/>",
+        "<w:cr/>",
+        "<w:ptab/>",
+        "<w:noBreakHyphen/>",
+        '<w:footnoteReference w:id="1"/>',
+        '<w:endnoteReference w:id="1"/>',
+        '<w:fldChar w:fldCharType="begin"/>',
+    ],
+)
+def test_partition_docx_counts_a_section_break_paragraph_that_holds_non_text_content(
+    tmp_path, content: str
+):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("", 1, 0), ("c", 1, 0)])
+    document = docx.Document(path)
+    paragraph = document.paragraphs[1]._p
+    paragraph.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    paragraph.append(parse_xml(f"<w:r {_W_NS}>{content}</w:r>"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "3. c"]
+
+
+@pytest.mark.parametrize("whitespace", [" ", "\u00a0", "\u2003"])
+def test_partition_docx_counts_a_section_break_paragraph_that_holds_whitespace(
+    tmp_path, whitespace: str
+):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), (whitespace, 1, 0), ("c", 1, 0)])
+    document = docx.Document(path)
+    document.paragraphs[1]._p.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "3. c"]
+
+
+def test_partition_docx_extracts_a_numbered_paragraph_in_a_style_based_on_a_numbering_style(
+    tmp_path,
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    numbering_style = document.styles.add_style("ListStyle", WD_STYLE_TYPE.LIST)
+    style = document.styles.add_style("Clause", WD_STYLE_TYPE.PARAGRAPH)
+    style.element.insert(1, parse_xml(f'<w:basedOn {_W_NS} w:val="{numbering_style.style_id}"/>'))
+    _add_direct_num_pr(document.add_paragraph("Scope", style="Clause"))
+    document.add_paragraph("after")
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. Scope", "after"]
+
+
+def test_partition_docx_counts_a_section_break_paragraph_whose_text_follows_a_page_break(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("", 1, 0), ("c", 1, 0)])
+    document = docx.Document(path)
+    paragraph = document.paragraphs[1]._p
+    paragraph.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    paragraph.append(parse_xml(f"<w:r {_W_NS}><w:rPr><w:b/></w:rPr></w:r>"))
+    paragraph.append(parse_xml(f"<w:r {_W_NS}><w:lastRenderedPageBreak/><w:t>b text</w:t></w:r>"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements if not isinstance(e, PageBreak)] == [
+        "1. a",
+        "2. b text",
+        "3. c",
+    ]
+
+
+def test_partition_docx_counts_a_section_break_paragraph_whose_text_is_in_a_content_control(
+    tmp_path,
+):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("", 1, 0), ("c", 1, 0), ("c1", 1, 1)])
+    document = docx.Document(path)
+    paragraph = document.paragraphs[1]._p
+    paragraph.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    paragraph.append(
+        parse_xml(f"<w:sdt {_W_NS}><w:sdtContent><w:r><w:t>b</w:t></w:r></w:sdtContent></w:sdt>")
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "2. b", "3. c", "a) c1"]
+
+
+def test_partition_docx_counts_a_section_break_paragraph_that_holds_only_an_equation(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("", 1, 0), ("c", 1, 0)])
+    document = docx.Document(path)
+    paragraph = document.paragraphs[1]._p
+    paragraph.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    paragraph.append(
+        parse_xml(
+            '<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+            "<m:r><m:t>x</m:t></m:r></m:oMath>"
+        )
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. a", "3. c"]
+
+
+def test_partition_docx_exposes_the_paragraph_style_name(tmp_path):
+    path = tmp_path / "styles.docx"
+    document = docx.Document()
+    document.add_paragraph("Report title", style="Title")
+    document.add_heading("Chapter", level=1)
+    document.add_heading("Section", level=2)
+    document.add_paragraph("Some narrative text.")
+    document.save(path)
+
+    elements = partition_docx(str(path))
+
+    assert [(e.text, e.metadata.category_depth, e.metadata.style_name) for e in elements] == [
+        ("Report title", 0, "Title"),
+        ("Chapter", 0, "Heading 1"),
+        ("Section", 1, "Heading 2"),
+        ("Some narrative text.", 0, "Normal"),
+    ]
+
+
+def test_partition_docx_keeps_the_heading_depth_of_a_directly_numbered_heading(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    for text, style in [("Chapter", "Heading 1"), ("Section", "Heading 2")]:
+        _add_direct_num_pr(document.add_paragraph(text, style=style))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text, e.metadata.category_depth) for e in elements] == [
+        (Title, "1. Chapter", 0),
+        (Title, "2. Section", 1),
+    ]
+
+
+def test_partition_docx_gives_a_numbered_heading_one_style_depth_whatever_its_list_level(tmp_path):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    _add_direct_num_pr(document.add_paragraph("Chapter", style="Heading 1"), ilvl=1)
+    _add_direct_num_pr(document.add_paragraph("Section", style="Heading 2"), ilvl=0)
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [(e.text, e.metadata.category_depth) for e in elements] == [
+        ("a) Chapter", 0),
+        ("1. Section", 1),
+    ]
+    assert elements[1].metadata.parent_id == elements[0].id
+
+
+def test_partition_docx_restarts_the_child_level_after_a_split_section_break_paragraph(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0), ("a1", 1, 1), ("", 1, 0), ("b1", 1, 1)])
+    document = docx.Document(path)
+    paragraph = document.paragraphs[2]._p
+    paragraph.get_or_add_pPr().append(
+        parse_xml(f'<w:sectPr {_W_NS}><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>')
+    )
+    paragraph.append(parse_xml(f"<w:r {_W_NS}><w:rPr><w:b/></w:rPr></w:r>"))
+    paragraph.append(parse_xml(f"<w:r {_W_NS}><w:lastRenderedPageBreak/><w:t>b</w:t></w:r>"))
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements if not isinstance(e, PageBreak)] == [
+        "1. a",
+        "a) a1",
+        "2. b",
+        "a) b1",
+    ]
+
+
+def test_partition_docx_keeps_a_list_style_when_numbering_is_disabled_on_an_outlined_paragraph(
+    tmp_path,
+):
+    path = _numbered_docx(tmp_path, [])
+    document = docx.Document(path)
+    paragraph = document.add_paragraph("x", style="List Paragraph")
+    _add_direct_num_pr(paragraph, num_id=0)
+    paragraph._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {_W_NS} w:val="0"/>'))
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    assert (type(element), element.text) == (ListItem, "x")
+
+
+def test_partition_docx_keeps_counting_child_levels_when_level_restart_is_zero(tmp_path):
+    no_restart = _lvl_xml(1, "decimal", "%2.").replace(
+        "<w:numFmt", '<w:lvlRestart w:val="0"/><w:numFmt'
+    )
+    numbering_xml = _single_definition_numbering(_lvl_xml(0, "decimal", "%1."), no_restart)
+    path = _numbered_docx(
+        tmp_path,
+        [("P", 1, 0), ("x", 1, 1), ("Q", 1, 0), ("y", 1, 1)],
+        numbering_xml=numbering_xml,
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["1. P", "1. x", "2. Q", "2. y"]
+
+
+def test_partition_docx_counts_a_numbered_paragraph_inside_a_table(tmp_path):
+    path = _numbered_docx(tmp_path, [("a", 1, 0)])
+    document = docx.Document(path)
+    cell = document.add_table(rows=1, cols=1).cell(0, 0)
+    cell.paragraphs[0].text = "in table"
+    cell.paragraphs[0]._p.get_or_add_pPr().append(
+        parse_xml(f'<w:numPr {_W_NS}><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>')
+    )
+    document.add_paragraph("c")._p.get_or_add_pPr().append(
+        parse_xml(f'<w:numPr {_W_NS}><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>')
+    )
+    document.save(path)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements if isinstance(e, ListItem)] == ["1. a", "3. c"]
+
+
+def test_partition_docx_shifts_link_offsets_past_the_generated_label(tmp_path):
+    path = _numbered_docx(tmp_path, [("", 1, 0)])
+    document = docx.Document(path)
+    url_id = document.part.relate_to(
+        "https://example.com/",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+    document.paragraphs[-1]._p.append(
+        parse_xml(
+            f'<w:hyperlink {_W_NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/'
+            f'relationships" r:id="{url_id}"><w:r><w:t>example</w:t></w:r></w:hyperlink>'
+        )
+    )
+    document.save(path)
+
+    (element,) = partition_docx(path)
+
+    (link,) = element.metadata.links
+    assert element.text == "1. example"
+    assert element.text[link["start_index"] :][: len(link["text"])] == "example"
+
+
+def test_partition_docx_ignores_a_list_level_outside_the_range_word_defines(tmp_path):
+    numbering_xml = _single_definition_numbering(
+        _lvl_xml(0, "decimal", "%1."), _lvl_xml(10_000_000, "decimal", "%1.")
+    )
+    path = _numbered_docx(tmp_path, [("deep", 1, 10_000_000)], numbering_xml=numbering_xml)
+
+    elements = partition_docx(path)
+
+    assert [(type(e), e.text) for e in elements] == [(ListItem, "deep")]
+
+
+def test_partition_docx_ignores_a_list_start_value_beyond_what_word_allows(tmp_path):
+    numbering_xml = _single_definition_numbering(
+        _lvl_xml(0, "lowerLetter", "%1.", start=900_000_000)
+    )
+    path = _numbered_docx(tmp_path, [("letters", 1, 0)], numbering_xml=numbering_xml)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["letters"]
+
+
+@pytest.mark.parametrize(
+    ("num_fmt", "start", "expected_labels"),
+    [
+        ("ordinal", 1, ["1st", "2nd", "3rd", "4th"]),
+        ("ordinal", 11, ["11th", "12th", "13th", "14th"]),
+        ("decimalEnclosedCircle", 1, ["①", "②", "③", "④"]),
+        ("decimalEnclosedCircle", 19, ["⑲", "⑳", "21", "22"]),
+    ],
+)
+def test_partition_docx_renders_ordinal_and_circled_number_formats(
+    tmp_path, num_fmt: str, start: int, expected_labels: list[str]
+):
+    numbering_xml = _single_definition_numbering(_lvl_xml(0, num_fmt, "%1", start=start))
+    path = _numbered_docx(
+        tmp_path, [(f"item {n}", 1, 0) for n in range(4)], numbering_xml=numbering_xml
+    )
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == [
+        f"{label} item {n}" for n, label in enumerate(expected_labels)
+    ]
+
+
+def test_partition_docx_falls_back_to_plain_text_for_a_number_format_it_cannot_render(tmp_path):
+    numbering_xml = _single_definition_numbering(_lvl_xml(0, "japaneseCounting", "%1"))
+    path = _numbered_docx(tmp_path, [("one", 1, 0), ("two", 1, 0)], numbering_xml=numbering_xml)
+
+    elements = partition_docx(path)
+
+    assert [e.text for e in elements] == ["one", "two"]
 
 
 # -- .metadata.filename --------------------------------------------------------------------------
@@ -247,73 +1708,44 @@ def test_partition_docx_from_file_prefers_metadata_filename_when_provided():
 # -- .metadata.last_modified ---------------------------------------------------------------------
 
 
-def test_partition_docx_metadata_date(mocker: MockFixture):
+def test_partition_docx_from_file_path_gets_last_modified_from_filesystem(mocker: MockFixture):
+    filesystem_last_modified = "2029-07-05T09:24:28"
     mocker.patch(
-        "unstructured.partition.docx.get_last_modified_date", return_value="2029-07-05T09:24:28"
+        "unstructured.partition.docx.get_last_modified_date", return_value=filesystem_last_modified
     )
 
     elements = partition_docx(example_doc_path("fake.docx"))
 
-    assert elements[0].metadata.last_modified == "2029-07-05T09:24:28"
+    assert elements[0].metadata.last_modified == filesystem_last_modified
 
 
-def test_partition_docx_metadata_date_with_custom_metadata(mocker: MockFixture):
-    mocker.patch(
-        "unstructured.partition.docx.get_last_modified_date", return_value="2023-11-01T14:13:07"
-    )
-
-    elements = partition_docx(
-        example_doc_path("fake.docx"), metadata_last_modified="2020-07-05T09:24:28"
-    )
-
-    assert elements[0].metadata.last_modified == "2020-07-05T09:24:28"
-
-
-def test_partition_docx_from_file_metadata_date(mocker: MockFixture):
-    mocker.patch(
-        "unstructured.partition.docx.get_last_modified_date_from_file",
-        return_value="2029-07-05T09:24:28",
-    )
-
-    with open(example_doc_path("fake.docx"), "rb") as f:
+def test_partition_docx_from_file_gets_last_modified_None():
+    with open(example_doc_path("simple.docx"), "rb") as f:
         elements = partition_docx(file=f)
 
     assert elements[0].metadata.last_modified is None
 
 
-def test_partition_docx_from_file_explicit_get_metadata_date(mocker: MockFixture):
+def test_partition_docx_from_file_path_prefers_metadata_last_modified(mocker: MockFixture):
+    filesystem_last_modified = "2023-11-01T14:13:07"
+    metadata_last_modified = "2020-07-05T09:24:28"
     mocker.patch(
-        "unstructured.partition.docx.get_last_modified_date_from_file",
-        return_value="2029-07-05T09:24:28",
+        "unstructured.partition.docx.get_last_modified_date", return_value=filesystem_last_modified
     )
 
-    with open(example_doc_path("fake.docx"), "rb") as f:
-        elements = partition_docx(file=f, date_from_file_object=True)
-
-    assert elements[0].metadata.last_modified == "2029-07-05T09:24:28"
-
-
-def test_partition_docx_from_file_metadata_date_with_custom_metadata(mocker: MockFixture):
-    mocker.patch(
-        "unstructured.partition.docx.get_last_modified_date_from_file",
-        return_value="2023-11-01T14:13:07",
+    elements = partition_docx(
+        example_doc_path("fake.docx"), metadata_last_modified=metadata_last_modified
     )
 
-    with open(example_doc_path("fake.docx"), "rb") as f:
-        elements = partition_docx(file=f, metadata_last_modified="2020-07-05T09:24:28")
-
-    assert elements[0].metadata.last_modified == "2020-07-05T09:24:28"
+    assert elements[0].metadata.last_modified == metadata_last_modified
 
 
-def test_partition_docx_from_file_without_metadata_date():
-    """Test partition_docx() with file that are not possible to get last modified date"""
-    with open(example_doc_path("fake.docx"), "rb") as f:
-        sf = tempfile.SpooledTemporaryFile()
-        sf.write(f.read())
-        sf.seek(0)
-        elements = partition_docx(file=sf, date_from_file_object=True)
+def test_partition_docx_from_file_prefers_metadata_last_modified():
+    metadata_last_modified = "2020-07-05T09:24:28"
+    with open(example_doc_path("simple.docx"), "rb") as f:
+        elements = partition_docx(file=f, metadata_last_modified=metadata_last_modified)
 
-    assert elements[0].metadata.last_modified is None
+    assert elements[0].metadata.last_modified == metadata_last_modified
 
 
 # ------------------------------------------------------------------------------------------------
@@ -371,6 +1803,174 @@ def test_table_emphasis(
     assert emphasized_text_tags == expected_emphasized_text_tags
 
 
+# -- layout-grid limit ---------------------------------------------------------------------------
+
+
+def _write_docx_with_spanned_tables(
+    tmp_path: pathlib.Path, *, n_tables: int, grid_span: int, grid_before: int = 0
+) -> str:
+    """Write a DOCX with `n_tables` 2-row tables, the second cell of each row bold and spanning
+    `grid_span` layout-grid positions, each row starting `grid_before` positions late."""
+    document = docx.Document()
+    for t in range(n_tables):
+        table = document.add_table(rows=2, cols=2)
+        for r, row in enumerate(table.rows):
+            row.cells[0].text = f"t{t}r{r}"
+            row.cells[1].paragraphs[0].add_run(f"bold{t}{r}").bold = True
+            tr = row._tr
+            if grid_before:
+                tr.get_or_add_trPr().append(
+                    parse_xml(f'<w:gridBefore {nsdecls("w")} w:val="{grid_before}"/>')
+                )
+            tr.tc_lst[1].get_or_add_tcPr().append(
+                parse_xml(f'<w:gridSpan {nsdecls("w")} w:val="{grid_span}"/>')
+            )
+    file_path = str(tmp_path / "spanned.docx")
+    document.save(file_path)
+    return file_path
+
+
+@pytest.mark.parametrize(
+    ("grid_span", "grid_before"),
+    [
+        (10_000_000, 0),
+        (1, 10_000_000),
+        # -- a negative count expands to nothing and must not cancel the positive span --
+        (10_000_000, -10_000_000),
+    ],
+)
+def test_partition_docx_omits_html_for_a_table_whose_grid_is_too_large(
+    grid_span: int, grid_before: int, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("DOCX_TABLE_MAX_CELLS", raising=False)  # -- default limit of 5M cells --
+    # -- 2 rows declaring 10M grid-positions each, from a file of a few dozen KB --
+    file_path = _write_docx_with_spanned_tables(
+        tmp_path, n_tables=1, grid_span=grid_span, grid_before=grid_before
+    )
+
+    (table,) = partition_docx(file_path)
+
+    assert isinstance(table, Table)
+    assert table.text == "t0r0 bold00 t0r1 bold01"
+    assert table.metadata.text_as_html is None
+    assert table.metadata.emphasized_text_contents == ["bold00", "bold01"]
+
+
+def test_partition_docx_limits_grid_cells_summed_across_tables(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    # -- each table spans 2 rows x (1 + 50) = 102 grid positions --
+    file_path = _write_docx_with_spanned_tables(tmp_path, n_tables=2, grid_span=50)
+    monkeypatch.setenv("DOCX_TABLE_MAX_CELLS", "203")
+
+    first, second = partition_docx(file_path)
+
+    assert first.metadata.text_as_html is not None
+    assert 'colspan="50"' in first.metadata.text_as_html
+    assert second.metadata.text_as_html is None
+    assert second.text == "t1r0 bold10 t1r1 bold11"
+
+
+def test_partition_docx_reads_a_spanned_cell_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("DOCX_TABLE_MAX_CELLS", raising=False)
+    file_path = _write_docx_with_spanned_tables(tmp_path, n_tables=1, grid_span=1000)
+
+    (table,) = partition_docx(file_path)
+
+    assert table.metadata.text_as_html == (
+        "<table>"
+        '<tr><td>t0r0</td><td colspan="1000">bold00</td></tr>'
+        '<tr><td>t0r1</td><td colspan="1000">bold01</td></tr>'
+        "</table>"
+    )
+    # -- emphasis is reported once per cell, not once per grid-position it spans --
+    assert table.metadata.emphasized_text_contents == ["bold00", "bold01"]
+    assert table.metadata.emphasized_text_tags == ["b", "b"]
+
+
+@pytest.mark.parametrize("grid_span_xml", ['<w:gridSpan {ns} w:val="bad"/>', "<w:gridSpan {ns}/>"])
+def test_partition_docx_keeps_the_text_of_a_table_with_an_invalid_grid_span(
+    grid_span_xml: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    # -- the second table spans 2 rows x (1 + 50) = 102 grid positions --
+    file_path = _write_docx_with_spanned_tables(tmp_path, n_tables=2, grid_span=50)
+    document = docx.Document(file_path)
+    bad_tc = document.tables[0].rows[0]._tr.tc_lst[1]
+    bad_tc.tcPr.remove(bad_tc.tcPr.find(qn("w:gridSpan")))
+    bad_tc.tcPr.append(parse_xml(grid_span_xml.format(ns=nsdecls("w"))))
+    document.save(file_path)
+    # -- the table with the invalid span uses none of the budget --
+    monkeypatch.setenv("DOCX_TABLE_MAX_CELLS", "102")
+
+    first, second = partition_docx(file_path)
+
+    assert first.text == "t0r0 bold00 t0r1 bold01"
+    assert first.metadata.text_as_html is None
+    assert second.metadata.text_as_html is not None
+    assert 'colspan="50"' in second.metadata.text_as_html
+
+
+@pytest.mark.parametrize("infer_table_structure", [True, False])
+@pytest.mark.parametrize("tag", ["b", "i"])
+def test_partition_docx_skips_table_emphasis_whose_formatting_cannot_be_read(
+    tag: str, infer_table_structure: bool, tmp_path: pathlib.Path
+):
+    document = docx.Document()
+    table = document.add_table(rows=1, cols=2)
+    bad_run = table.cell(0, 0).paragraphs[0].add_run("unreadable")
+    bad_run._r.get_or_add_rPr().append(parse_xml(f'<w:{tag} {nsdecls("w")} w:val="bad"/>'))
+    table.cell(0, 1).paragraphs[0].add_run("readable").bold = True
+    document.add_paragraph("after the table")
+    file_path = str(tmp_path / "bad-emphasis.docx")
+    document.save(file_path)
+
+    elements = partition_docx(file_path, infer_table_structure=infer_table_structure)
+
+    assert [e.text for e in elements] == ["unreadable readable", "after the table"]
+    assert elements[0].metadata.emphasized_text_contents == ["readable"]
+    assert elements[0].metadata.emphasized_text_tags == ["b"]
+
+
+def test_partition_docx_reports_emphasis_of_a_vertically_merged_cell_once(tmp_path: pathlib.Path):
+    document = docx.Document()
+    table = document.add_table(rows=3, cols=2)
+    merged = table.cell(0, 0).merge(table.cell(2, 0))
+    merged.paragraphs[0].add_run("merged").bold = True
+    for r in range(3):
+        table.cell(r, 1).text = f"r{r}"
+    file_path = str(tmp_path / "vmerge.docx")
+    document.save(file_path)
+
+    (table_element,) = partition_docx(file_path)
+
+    assert table_element.metadata.emphasized_text_contents == ["merged"]
+    assert 'rowspan="3"' in (table_element.metadata.text_as_html or "")
+
+
+def test_partition_docx_does_not_expand_a_large_span_in_a_nested_table(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("DOCX_TABLE_MAX_CELLS", raising=False)
+    document = docx.Document()
+    outer = document.add_table(rows=1, cols=1)
+    outer.cell(0, 0).text = "outer"
+    nested = outer.cell(0, 0).add_table(rows=1, cols=2)
+    nested.cell(0, 0).text = "nested"
+    nested.cell(0, 1).text = "wide"
+    nested.rows[0]._tr.tc_lst[1].get_or_add_tcPr().append(
+        parse_xml(f'<w:gridSpan {nsdecls("w")} w:val="10000000"/>')
+    )
+    file_path = str(tmp_path / "nested.docx")
+    document.save(file_path)
+
+    (table_element,) = partition_docx(file_path)
+
+    assert table_element.text == "outer nested wide"
+    assert "nested wide" in (table_element.metadata.text_as_html or "")
+
+
 def test_partition_docx_grabs_emphasized_texts(
     expected_emphasized_text_contents: list[str],
     expected_emphasized_text_tags: list[str],
@@ -423,9 +2023,9 @@ def test_parse_category_depth_by_style(opts_args: dict[str, Any]):
         paragraph = paragraphs[idx]
         actual_depth = partitioner._parse_category_depth_by_style(paragraph)
         assert text in paragraph.text, f"paragraph[{[idx]}].text does not contain {text}"
-        assert (
-            actual_depth == depth
-        ), f"expected paragraph[{idx}] to have depth=={depth}, got {actual_depth}"
+        assert actual_depth == depth, (
+            f"expected paragraph[{idx}] to have depth=={depth}, got {actual_depth}"
+        )
 
 
 def test_parse_category_depth_by_style_name(opts_args: dict[str, Any]):
@@ -448,9 +2048,9 @@ def test_parse_category_depth_by_style_name(opts_args: dict[str, Any]):
     ]
 
     for idx, (depth, text) in enumerate(test_cases):
-        assert (
-            partitioner._parse_category_depth_by_style_name(text) == depth
-        ), f"test case {test_cases[idx]} failed"
+        assert partitioner._parse_category_depth_by_style_name(text) == depth, (
+            f"test case {test_cases[idx]} failed"
+        )
 
 
 def test_parse_category_depth_by_style_ilvl(opts_args: dict[str, Any]):
@@ -511,10 +2111,7 @@ def test_partition_docx_respects_languages_arg():
 def test_partition_docx_raises_TypeError_for_invalid_languages():
     with pytest.raises(TypeError):
         filename = example_doc_path("handbook-1p.docx")
-        partition_docx(
-            filename=filename,
-            languages="eng",  # pyright: ignore[reportArgumentType]
-        )
+        partition_docx(filename=filename, languages="eng")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -678,7 +2275,7 @@ def expected_elements() -> list[Text]:
         Title("These are a few of my favorite things:"),
         ListItem("Parrots"),
         ListItem("Hockey"),
-        Title("Analysis"),
+        Text("Analysis"),
         NarrativeText("This is my first thought. This is my second thought."),
         NarrativeText("This is my third thought."),
         Text("2023"),
@@ -748,13 +2345,10 @@ def opts_args() -> dict[str, Any]:
     compact for testing purposes.
     """
     return {
-        "date_from_file_object": False,
         "file": None,
         "file_path": None,
         "include_page_breaks": True,
         "infer_table_structure": True,
-        "metadata_file_path": None,
-        "metadata_last_modified": None,
         "strategy": None,
     }
 
@@ -769,6 +2363,19 @@ def opts_args() -> dict[str, Any]:
 
 class DescribeDocxPartitionerOptions:
     """Unit-test suite for `unstructured.partition.docx.DocxPartitionerOptions` objects."""
+
+    # -- .load() ---------------------------------
+
+    def it_provides_a_validating_constructor(self, opts_args: dict[str, Any]):
+        opts_args["file_path"] = example_doc_path("simple.docx")
+
+        opts = DocxPartitionerOptions.load(**opts_args)
+
+        assert isinstance(opts, DocxPartitionerOptions)
+
+    def and_it_raises_when_options_are_not_valid(self, opts_args: dict[str, Any]):
+        with pytest.raises(ValueError, match="no DOCX document specified, "):
+            DocxPartitionerOptions.load(**opts_args)
 
     # -- .document -------------------------------
 
@@ -842,15 +2449,7 @@ class DescribeDocxPartitionerOptions:
 
     # -- .last_modified --------------------------
 
-    def it_gets_the_last_modified_date_of_the_document_from_the_caller_when_provided(
-        self, opts_args: dict[str, Any]
-    ):
-        opts_args["metadata_last_modified"] = "2024-03-05T17:02:53"
-        opts = DocxPartitionerOptions(**opts_args)
-
-        assert opts.last_modified == "2024-03-05T17:02:53"
-
-    def and_it_falls_back_to_the_last_modified_date_of_the_file_when_a_path_is_provided(
+    def it_gets_last_modified_from_the_filesystem_when_file_path_is_provided(
         self, opts_args: dict[str, Any], get_last_modified_date_: Mock
     ):
         opts_args["file_path"] = "a/b/document.docx"
@@ -862,51 +2461,22 @@ class DescribeDocxPartitionerOptions:
         get_last_modified_date_.assert_called_once_with("a/b/document.docx")
         assert last_modified == "2024-04-02T20:32:35"
 
-    def and_it_falls_back_to_the_last_modified_date_of_the_file_when_a_file_like_object_is_provided(
-        self, opts_args: dict[str, Any], get_last_modified_date_from_file_: Mock
+    def but_it_falls_back_to_None_for_the_last_modified_date_when_no_file_path_is_provided(
+        self, opts_args: dict[str, Any]
     ):
         file = io.BytesIO(b"abcdefg")
         opts_args["file"] = file
-        opts_args["date_from_file_object"] = True
-        get_last_modified_date_from_file_.return_value = "2024-04-02T20:42:07"
         opts = DocxPartitionerOptions(**opts_args)
 
-        last_modified = opts.last_modified
-
-        get_last_modified_date_from_file_.assert_called_once_with(file)
-        assert last_modified == "2024-04-02T20:42:07"
-
-    def but_it_falls_back_to_None_for_the_last_modified_date_when_date_from_file_object_is_False(
-        self, opts_args: dict[str, Any], get_last_modified_date_from_file_: Mock
-    ):
-        file = io.BytesIO(b"abcdefg")
-        opts_args["file"] = file
-        opts_args["date_from_file_object"] = False
-        get_last_modified_date_from_file_.return_value = "2024-04-02T20:42:07"
-        opts = DocxPartitionerOptions(**opts_args)
-
-        last_modified = opts.last_modified
-
-        get_last_modified_date_from_file_.assert_not_called()
-        assert last_modified is None
+        assert opts.last_modified is None
 
     # -- .metadata_file_path ---------------------
 
-    def it_uses_the_user_provided_file_path_in_the_metadata_when_provided(
-        self, opts_args: dict[str, Any]
-    ):
-        opts_args["file_path"] = "x/y/z.docx"
-        opts_args["metadata_file_path"] = "a/b/c.docx"
-        opts = DocxPartitionerOptions(**opts_args)
-
-        assert opts.metadata_file_path == "a/b/c.docx"
-
     @pytest.mark.parametrize("file_path", ["u/v/w.docx", None])
-    def and_it_falls_back_to_the_document_file_path_otherwise(
+    def it_uses_the_file_path_argument_when_provided(
         self, file_path: str | None, opts_args: dict[str, Any]
     ):
         opts_args["file_path"] = file_path
-        opts_args["metadata_file_path"] = None
         opts = DocxPartitionerOptions(**opts_args)
 
         assert opts.metadata_file_path == file_path
@@ -997,19 +2567,16 @@ class DescribeDocxPartitionerOptions:
 
         assert opts._docx_file == "l/m/n.docx"
 
-    def and_it_uses_a_BytesIO_file_to_replaces_a_SpooledTemporaryFile_provided(
-        self, opts_args: dict[str, Any]
-    ):
-        spooled_temp_file = tempfile.SpooledTemporaryFile()
-        spooled_temp_file.write(b"abcdefg")
-        opts_args["file"] = spooled_temp_file
-        opts = DocxPartitionerOptions(**opts_args)
+    def and_it_uses_a_SpooledTemporaryFile_directly(self, opts_args: dict[str, Any]):
+        with tempfile.SpooledTemporaryFile() as spooled_temp_file:
+            spooled_temp_file.write(b"abcdefg")
+            opts_args["file"] = spooled_temp_file
+            opts = DocxPartitionerOptions(**opts_args)
 
-        docx_file = opts._docx_file
+            docx_file = opts._docx_file
 
-        assert docx_file is not spooled_temp_file
-        assert isinstance(docx_file, io.BytesIO)
-        assert docx_file.getvalue() == b"abcdefg"
+            assert docx_file is spooled_temp_file
+            assert docx_file.read() == b"abcdefg"
 
     def and_it_uses_the_provided_file_directly_when_not_a_SpooledTemporaryFile(
         self, opts_args: dict[str, Any]
@@ -1024,25 +2591,37 @@ class DescribeDocxPartitionerOptions:
         assert isinstance(docx_file, io.BytesIO)
         assert docx_file.getvalue() == b"abcdefg"
 
-    def but_it_raises_ValueError_when_neither_a_file_path_or_file_is_provided(
+    # -- ._validate() ----------------------------
+
+    def it_raises_when_no_file_exists_at_file_path(self, opts_args: dict[str, Any]):
+        opts_args["file_path"] = "l/m/n.docx"
+        with pytest.raises(FileNotFoundError, match="no such file or directory: 'l/m/n.docx'"):
+            DocxPartitionerOptions.load(**opts_args)
+
+    def and_it_raises_when_the_file_at_file_path_is_not_a_ZIP_archive(
         self, opts_args: dict[str, Any]
     ):
-        opts = DocxPartitionerOptions(**opts_args)
+        opts_args["file_path"] = example_doc_path("simple.doc")
+        with pytest.raises(ValueError, match=r"not a ZIP archive \(so not a DOCX file\): "):
+            DocxPartitionerOptions.load(**opts_args)
 
-        with pytest.raises(ValueError, match="No DOCX document specified, either `filename` or "):
-            opts._docx_file
+    def and_it_raises_when_the_file_like_object_is_not_a_ZIP_archive(
+        self, opts_args: dict[str, Any]
+    ):
+        with open(example_doc_path("simple.doc"), "rb") as f:
+            opts_args["file"] = f
+            with pytest.raises(ValueError, match=r"not a ZIP archive \(so not a DOCX file\): "):
+                DocxPartitionerOptions.load(**opts_args)
+
+    def and_it_raises_when_neither_a_file_path_or_file_is_provided(self, opts_args: dict[str, Any]):
+        with pytest.raises(ValueError, match="no DOCX document specified, either `filename` or "):
+            DocxPartitionerOptions.load(**opts_args)
 
     # -- fixtures --------------------------------------------------------------------------------
 
     @pytest.fixture()
     def get_last_modified_date_(self, request: FixtureRequest) -> Mock:
         return function_mock(request, "unstructured.partition.docx.get_last_modified_date")
-
-    @pytest.fixture()
-    def get_last_modified_date_from_file_(self, request: FixtureRequest):
-        return function_mock(
-            request, "unstructured.partition.docx.get_last_modified_date_from_file"
-        )
 
 
 class Describe_DocxPartitioner:
@@ -1055,13 +2634,9 @@ class Describe_DocxPartitioner:
         table = docx.Document(example_doc_path("docx-tables.docx")).tables[0]
 
         assert _DocxPartitioner(opts)._convert_table_to_html(table) == (
-            "<table>\n"
-            "<thead>\n"
-            "<tr><th>Header Col 1  </th><th>Header Col 2  </th></tr>\n"
-            "</thead>\n"
-            "<tbody>\n"
-            "<tr><td>Lorem ipsum   </td><td>A link example</td></tr>\n"
-            "</tbody>\n"
+            "<table>"
+            "<tr><td>Header Col 1</td><td>Header Col 2</td></tr>"
+            "<tr><td>Lorem ipsum</td><td>A link example</td></tr>"
             "</table>"
         )
 
@@ -1087,25 +2662,13 @@ class Describe_DocxPartitioner:
         # -- re.sub() strips out the extra padding inserted by tabulate --
         html = re.sub(r" +<", "<", _DocxPartitioner(opts)._convert_table_to_html(table))
 
-        expected_lines = [
-            "<table>",
-            "<thead>",
-            "<tr><th>a</th><th>&gt;b&lt;</th><th>c</th></tr>",
-            "</thead>",
-            "<tbody>",
-            "<tr><td>d</td><td><table>",
-            "<tbody>",
-            "<tr><td>e</td><td>f</td></tr>",
-            "<tr><td>g&amp;t</td><td>h</td></tr>",
-            "</tbody>",
-            "</table></td><td>i</td></tr>",
-            "<tr><td>j</td><td>k</td><td>l</td></tr>",
-            "</tbody>",
-            "</table>",
-        ]
-        actual_lines = html.splitlines()
-        for expected, actual in zip(expected_lines, actual_lines):
-            assert actual == expected, f"\nexpected: {repr(expected)}\nactual:   {repr(actual)}"
+        assert html == (
+            "<table>"
+            "<tr><td>a</td><td>&gt;b&lt;</td><td>c</td></tr>"
+            "<tr><td>d</td><td>e f g&amp;t h</td><td>i</td></tr>"
+            "<tr><td>j</td><td>k</td><td>l</td></tr>"
+            "</table>"
+        )
 
     def it_can_convert_a_table_to_plain_text(self, opts_args: dict[str, Any]):
         opts = DocxPartitionerOptions(**opts_args)
@@ -1154,6 +2717,31 @@ class Describe_DocxPartitioner:
         table = docx.Document(example_doc_path("docx-tables.docx")).tables[2]
         assert " ".join(_DocxPartitioner(opts)._iter_table_texts(table)) == "a b c d e"
 
+    def and_the_html_of_a_merged_cell_carries_colspan_and_rowspan_instead_of_repeating_text(
+        self, opts_args: dict[str, Any]
+    ):
+        """
+        Fixture table is:
+
+            +---+-------+
+            | a | b     |
+            |   +---+---+
+            |   | c | d |
+            +---+---+   |
+            | e     |   |
+            +-------+---+
+        """
+        opts = DocxPartitionerOptions(**opts_args)
+        table = docx.Document(example_doc_path("docx-tables.docx")).tables[2]
+
+        assert _DocxPartitioner(opts)._convert_table_to_html(table) == (
+            "<table>"
+            '<tr><td rowspan="2">a</td><td colspan="2">b</td></tr>'
+            '<tr><td>c</td><td rowspan="2">d</td></tr>'
+            '<tr><td colspan="2">e</td></tr>'
+            "</table>"
+        )
+
     def it_can_partition_tables_with_incomplete_rows(self):
         """DOCX permits table rows to start late and end early.
 
@@ -1185,10 +2773,7 @@ class Describe_DocxPartitioner:
         assert type(e).__name__ == "Table"
         assert e.text == "a b c d"
         assert e.metadata.text_as_html == (
-            "<table>\n"
-            "<thead>\n<tr><th>a  </th><th>b  </th></tr>\n</thead>\n"
-            "<tbody>\n<tr><td>c  </td><td>d  </td></tr>\n</tbody>\n"
-            "</table>"
+            "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>"
         )
         # --
         # ┌───┐
@@ -1200,10 +2785,7 @@ class Describe_DocxPartitioner:
         assert type(e).__name__ == "Table"
         assert e.text == "a b c", f"actual {e.text=}"
         assert e.metadata.text_as_html == (
-            "<table>\n"
-            "<thead>\n<tr><th>a  </th><th>  </th></tr>\n</thead>\n"
-            "<tbody>\n<tr><td>b  </td><td>c </td></tr>\n</tbody>\n"
-            "</table>"
+            "<table><tr><td>a</td><td/></tr><tr><td>b</td><td>c</td></tr></table>"
         ), f"actual {e.metadata.text_as_html=}"
         # --
         # ┌───────┐
@@ -1215,9 +2797,9 @@ class Describe_DocxPartitioner:
         assert type(e).__name__ == "Table"
         assert e.text == "a b c d", f"actual {e.text=}"
         assert e.metadata.text_as_html == (
-            "<table>\n"
-            "<thead>\n<tr><th>a  </th><th>a  </th><th>  </th></tr>\n</thead>\n"
-            "<tbody>\n<tr><td>b  </td><td>c  </td><td>d </td></tr>\n</tbody>\n"
+            "<table>"
+            '<tr><td colspan="2">a</td><td/></tr>'
+            "<tr><td>b</td><td>c</td><td>d</td></tr>"
             "</table>"
         ), f"actual {e.metadata.text_as_html=}"
         # --
@@ -1230,9 +2812,9 @@ class Describe_DocxPartitioner:
         assert type(e).__name__ == "Table"
         assert e.text == "a b c d", f"actual {e.text=}"
         assert e.metadata.text_as_html == (
-            "<table>\n"
-            "<thead>\n<tr><th>a  </th><th>b  </th><th>  </th></tr>\n</thead>\n"
-            "<tbody>\n<tr><td>a  </td><td>c  </td><td>d </td></tr>\n</tbody>\n"
+            "<table>"
+            '<tr><td rowspan="2">a</td><td>b</td><td/></tr>'
+            "<tr><td>c</td><td>d</td></tr>"
             "</table>"
         ), f"actual {e.metadata.text_as_html=}"
         # -- late-start, early-end, and >2 rows vertical span --
@@ -1249,14 +2831,11 @@ class Describe_DocxPartitioner:
         assert type(e).__name__ == "Table"
         assert e.text == "a b c d e f", f"actual {e.text=}"
         assert e.metadata.text_as_html == (
-            "<table>\n"
-            "<thead>\n"
-            "<tr><th>a  </th><th>a  </th><th>b  </th><th>c  </th></tr>\n"
-            "</thead>\n<tbody>\n"
-            "<tr><td>   </td><td>d  </td><td>d  </td><td>   </td></tr>\n"
-            "<tr><td>e  </td><td>d  </td><td>d  </td><td>f  </td></tr>\n"
-            "<tr><td>   </td><td>d  </td><td>d  </td><td>   </td></tr>\n"
-            "</tbody>\n"
+            "<table>"
+            '<tr><td colspan="2">a</td><td>b</td><td>c</td></tr>'
+            '<tr><td/><td colspan="2" rowspan="3">d</td><td/></tr>'
+            "<tr><td>e</td><td>f</td></tr>"
+            "<tr><td/><td/></tr>"
             "</table>"
         ), f"actual {e.metadata.text_as_html=}"
         # --
@@ -1265,19 +2844,15 @@ class Describe_DocxPartitioner:
         assert type(e).__name__ == "Table"
         assert e.text == "Data More Dato WTF? Strange Format", f"actual {e.text=}"
         assert e.metadata.text_as_html == (
-            "<table>\n"
-            "<thead>\n"
-            "<tr><th>Data   </th><th>Data   </th><th>      </th></tr>\n"
-            "</thead>\n"
-            "<tbody>\n"
-            "<tr><td>Data   </td><td>Data   </td><td>      </td></tr>\n"
-            "<tr><td>Data   </td><td>Data   </td><td>      </td></tr>\n"
-            "<tr><td>       </td><td>More   </td><td>      </td></tr>\n"
-            "<tr><td>Dato   </td><td>       </td><td>      </td></tr>\n"
-            "<tr><td>WTF?   </td><td>WTF?   </td><td>      </td></tr>\n"
-            "<tr><td>Strange</td><td>Strange</td><td>      </td></tr>\n"
-            "<tr><td>       </td><td>Format </td><td>Format</td></tr>\n"
-            "</tbody>\n"
+            "<table>"
+            '<tr><td colspan="2" rowspan="3">Data</td><td/></tr>'
+            "<tr><td/></tr>"
+            "<tr><td/></tr>"
+            "<tr><td/><td>More</td><td/></tr>"
+            "<tr><td>Dato</td><td/></tr>"
+            '<tr><td colspan="2">WTF?</td><td/></tr>'
+            '<tr><td colspan="2">Strange</td><td/></tr>'
+            '<tr><td/><td colspan="2">Format</td></tr>'
             "</table>"
         ), f"actual {e.metadata.text_as_html=}"
 
@@ -1305,7 +2880,7 @@ class Describe_DocxPartitioner:
         opts_args["file_path"] = example_doc_path("page-breaks.docx")
         opts = DocxPartitionerOptions(**opts_args)
         expected = [
-            # NOTE(scanny) - -- page 1 --
+            # -- page 1 --
             NarrativeText(
                 "First page, tab here:\t"
                 "followed by line-break here:\n"
@@ -1315,28 +2890,28 @@ class Describe_DocxPartitioner:
                 "and hard page-break here>>"
             ),
             PageBreak(""),
-            # NOTE(scanny) - -- page 2 --
+            # -- page 2 --
             NarrativeText(
                 "<<Text on second page. The font is big so it breaks onto third page--"
                 "------------------here-->> <<but break falls inside link so text stays"
                 " together."
             ),
             PageBreak(""),
-            # NOTE(scanny) - -- page 3 --
-            NarrativeText("Continuous section break here>>"),
+            # -- page 3 --
+            Text("Continuous section break here>>"),
             NarrativeText("<<followed by text on same page"),
-            NarrativeText("Odd-page section break here>>"),
+            Text("Odd-page section break here>>"),
             PageBreak(""),
-            # NOTE(scanny) - -- page 4 --
+            # -- page 4 --
             PageBreak(""),
-            # NOTE(scanny) - -- page 5 --
+            # -- page 5 --
             NarrativeText("<<producing two page-breaks to get from page-3 to page-5."),
             NarrativeText(
                 'Then text gets big again so a "natural" rendered page break happens again here>> '
             ),
             PageBreak(""),
-            # NOTE(scanny) - -- page 6 --
-            Title("<<and then more text proceeds."),
+            # -- page 6 --
+            Text("<<and then more text proceeds."),
         ]
 
         elements = _DocxPartitioner.iter_document_elements(opts)
@@ -1372,3 +2947,86 @@ class Describe_DocxPartitioner:
 
         element = next(footer_iter)
         assert element.text == "para1\ncell1 a b c d e f\npara2"
+
+    def it_traverses_document_blocks_once_for_many_sections(
+        self, opts_args: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ):
+        """Partitioning avoids the per-section full-prefix scans in python-docx."""
+        document = docx.Document()
+        expected_texts: list[str] = []
+        for section_idx in range(25):
+            text = f"section-{section_idx}"
+            document.add_paragraph(text)
+            expected_texts.append(text)
+            if section_idx < 24:
+                document.add_section(WD_SECTION.CONTINUOUS)
+
+        file = io.BytesIO()
+        document.save(file)
+        file.seek(0)
+        opts_args["file"] = file
+
+        def fail_on_section_scan(_self: Section) -> Iterator[Paragraph]:
+            raise AssertionError("partitioner must not scan each section from document start")
+
+        monkeypatch.setattr(Section, "iter_inner_content", fail_on_section_scan)
+
+        elements = list(
+            _DocxPartitioner.iter_document_elements(DocxPartitionerOptions(**opts_args))
+        )
+
+        assert [element.text for element in elements] == expected_texts
+
+    def it_partitions_a_document_without_a_body_level_sectPr(self, opts_args: dict[str, Any]):
+        """A paragraph-level final section boundary does not require a body-level sentinel."""
+        document = docx.Document()
+        document.sections[0].header.paragraphs[0].text = "Header"
+        document.sections[0].footer.paragraphs[0].text = "Footer"
+        paragraph = document.add_paragraph("Body")
+        paragraph._p.get_or_add_pPr().append(document._element.body.sectPr)
+
+        file = io.BytesIO()
+        document.save(file)
+        file.seek(0)
+        opts_args["file"] = file
+
+        elements = list(
+            _DocxPartitioner.iter_document_elements(DocxPartitionerOptions(**opts_args))
+        )
+
+        assert [element.text for element in elements] == ["Header", "Body", "Footer"]
+
+
+def test_partition_docx_skips_a_header_whose_relationship_is_missing(
+    caplog: pytest.LogCaptureFixture,
+):
+    """A dangling header `r:id` must not abort partitioning with a raw `KeyError`.
+
+    The body content is still returned and a warning records the dropped header.
+    """
+    document = docx.Document()
+    document.add_paragraph("Body")
+    sectPr = document.sections[0]._sectPr
+    headerReference = sectPr.makeelement(qn("w:headerReference"), {})
+    headerReference.set(qn("r:id"), "rIdDoesNotExist")
+    headerReference.set(qn("w:type"), "default")
+    sectPr.insert(0, headerReference)
+
+    file = io.BytesIO()
+    document.save(file)
+    file.seek(0)
+
+    with caplog.at_level(logging.WARNING):
+        elements = partition_docx(file=file)
+
+    assert [element.text for element in elements] == ["Body"]
+    assert "unresolved relationship id" in caplog.text
+
+
+def test_partition_docx_skips_malformed_row_cells():
+    """Test that partition_docx does not crash on a DOCX with malformed/merged table rows."""
+    elements = partition_docx(example_doc_path("grid_offset_error.docx"))
+
+    assert isinstance(elements, list)
+    assert all(hasattr(el, "text") for el in elements)
+    assert any(el.text.strip() for el in elements), "Expected some non-empty extracted text"

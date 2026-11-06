@@ -29,7 +29,7 @@ if [ -z "$MS_CLIENT_ID" ] || [ -z "$MS_CLIENT_CRED" ] || [ -z "$MS_TENANT_ID" ] 
   exit 8
 fi
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   outlook \
   --download-dir "$DOWNLOAD_DIR" \
@@ -37,7 +37,6 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --num-processes "$max_processes" \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --client-cred "$MS_CLIENT_CRED" \
   --client-id "$MS_CLIENT_ID" \
@@ -45,6 +44,8 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --user-email "$MS_USER_EMAIL" \
   --outlook-folders IntegrationTest \
   --recursive \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

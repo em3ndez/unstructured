@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
+from contextlib import contextmanager
 from copy import deepcopy
-from io import BytesIO
+from io import BufferedReader, BytesIO, TextIOWrapper
 from pathlib import Path, PurePath
 from typing import IO, TYPE_CHECKING, BinaryIO, Iterator, List, Optional, Tuple, Union, cast
 
@@ -14,19 +16,18 @@ import cv2
 import numpy as np
 import pdf2image
 from PIL import Image
+from unstructured_inference.inference.layout import convert_pdf_to_image as render_pdf_to_image
+from unstructured_inference.inference.pdf_image import PdfRenderTooLargeError
 
 from unstructured.documents.elements import ElementType
+from unstructured.errors import UnprocessableEntityError
 from unstructured.logger import logger
-from unstructured.partition.common import (
-    convert_to_bytes,
-    exactly_one,
-    get_last_modified_date,
-    get_last_modified_date_from_file,
-)
+from unstructured.partition.common.common import copy_file_to_stream, exactly_one
 from unstructured.partition.utils.config import env_config
 
 if TYPE_CHECKING:
-    from unstructured_inference.inference.layout import DocumentLayout, PageLayout, TextRegion
+    from unstructured_inference.inference.elements import TextRegion
+    from unstructured_inference.inference.layout import DocumentLayout, PageLayout
     from unstructured_inference.inference.layoutelement import LayoutElement
 
     from unstructured.documents.elements import Element
@@ -59,32 +60,28 @@ def write_image(image: Union[Image.Image, np.ndarray], output_image_path: str):
 def convert_pdf_to_image(
     filename: str,
     file: Optional[Union[bytes, BinaryIO]] = None,
-    dpi: int = 200,
+    dpi: Optional[int] = None,
     output_folder: Optional[Union[str, PurePath]] = None,
     path_only: bool = False,
+    password: Optional[str] = None,
 ) -> Union[List[Image.Image], List[str]]:
-    """Get the image renderings of the pdf pages using pdf2image"""
+    exactly_one(filename=filename, file=file)
 
-    if path_only and not output_folder:
-        raise ValueError("output_folder must be specified if path_only is true")
+    if dpi is None:
+        dpi = env_config.PDF_RENDER_DPI
 
-    if file is not None:
-        f_bytes = convert_to_bytes(file)
-        images = pdf2image.convert_from_bytes(
-            f_bytes,
+    try:
+        return render_pdf_to_image(
+            filename=filename,
+            file=file,
             dpi=dpi,
             output_folder=output_folder,
-            paths_only=path_only,
+            path_only=path_only,
+            password=password,
+            pdf_render_max_pixels_per_page=env_config.PDF_RENDER_MAX_PIXELS_PER_PAGE,
         )
-    else:
-        images = pdf2image.convert_from_path(
-            filename,
-            dpi=dpi,
-            output_folder=output_folder,
-            paths_only=path_only,
-        )
-
-    return images
+    except PdfRenderTooLargeError as exc:
+        raise UnprocessableEntityError(str(exc)) from exc
 
 
 def pad_element_bboxes(
@@ -121,13 +118,15 @@ def pad_bbox(
 
 def save_elements(
     elements: List["Element"],
+    starting_page_number: int,
     element_category_to_save: str,
     pdf_image_dpi: int,
     filename: str = "",
-    file: Optional[Union[bytes, BinaryIO]] = None,
+    file: bytes | IO[bytes] | None = None,
     is_image: bool = False,
     extract_image_block_to_payload: bool = False,
-    output_dir_path: Optional[str] = None,
+    output_dir_path: str | None = None,
+    password: Optional[str] = None,
 ):
     """
     Saves specific elements from a PDF as images either to a directory or embeds them in the
@@ -138,24 +137,29 @@ def save_elements(
     a specified directory or embedded into the element's payload as a base64-encoded string.
     """
 
-    if not output_dir_path:
-        if env_config.GLOBAL_WORKING_DIR_ENABLED:
-            output_dir_path = str(Path(env_config.GLOBAL_WORKING_PROCESS_DIR) / "figures")
-        else:
-            output_dir_path = str(Path.cwd() / "figures")
-    os.makedirs(output_dir_path, exist_ok=True)
+    # Determine the output directory path
+    if not extract_image_block_to_payload:
+        output_dir_path = output_dir_path or (
+            str(Path(env_config.GLOBAL_WORKING_PROCESS_DIR) / "figures")
+            if env_config.GLOBAL_WORKING_DIR_ENABLED
+            else str(Path.cwd() / "figures")
+        )
+
+        os.makedirs(output_dir_path, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         if is_image:
             if file is None:
                 image_paths = [filename]
             else:
-                if hasattr(file, "seek"):
-                    file.seek(0)
-                temp_file = tempfile.NamedTemporaryFile(delete=False, dir=temp_dir)
-                temp_file.write(file.read() if hasattr(file, "read") else file)
-                temp_file.flush()
-                image_paths = [temp_file.name]
+                tmp_file_path = os.path.join(temp_dir, "tmp_file")
+                with open(tmp_file_path, "wb") as tmp_file:
+                    if isinstance(file, bytes):
+                        tmp_file.write(file)
+                    else:
+                        file.seek(0)
+                        shutil.copyfileobj(file, tmp_file, length=1024 * 1024)
+                image_paths = [tmp_file_path]
         else:
             _image_paths = convert_pdf_to_image(
                 filename,
@@ -163,6 +167,7 @@ def save_elements(
                 pdf_image_dpi,
                 output_folder=temp_dir,
                 path_only=True,
+                password=password,
             )
             image_paths = cast(List[str], _image_paths)
 
@@ -176,36 +181,63 @@ def save_elements(
                 continue
 
             points = coordinates.points
-            x1, y1 = points[0]
-            x2, y2 = points[2]
+            # Don't assume a fixed corner ordering: depending on the element's
+            # coordinate-system orientation, points[0]/points[2] are not reliably the
+            # top-left/bottom-right in the page image's screen space. Trusting them can
+            # yield an inverted PIL crop box and raise "Coordinate 'lower' is less than
+            # 'upper'". Take the extent of all points instead.
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            x1, y1 = min(xs), min(ys)
+            x2, y2 = max(xs), max(ys)
             h_padding = env_config.EXTRACT_IMAGE_BLOCK_CROP_HORIZONTAL_PAD
             v_padding = env_config.EXTRACT_IMAGE_BLOCK_CROP_VERTICAL_PAD
             padded_bbox = cast(
                 Tuple[int, int, int, int], pad_bbox((x1, y1, x2, y2), (h_padding, v_padding))
             )
-            page_number = el.metadata.page_number
+
+            # The page number in the metadata may have been offset
+            # by starting_page_number. Make sure we use the right
+            # value for indexing!
+            assert el.metadata.page_number
+            metadata_page_number = el.metadata.page_number
+            page_index = metadata_page_number - starting_page_number
 
             figure_number += 1
             try:
-                basename = "table" if el.category == ElementType.TABLE else "figure"
-                output_f_path = os.path.join(
-                    output_dir_path,
-                    f"{basename}-{page_number}-{figure_number}.jpg",
-                )
-                image_path = image_paths[page_number - 1]
+                image_path = image_paths[page_index]
+                # The crop owns its pixels; release the decoded page before encoding it.
+                # Image.close() frees the pixel data, which the context manager does not.
                 image = Image.open(image_path)
-                cropped_image = image.crop(padded_bbox)
-                if extract_image_block_to_payload:
-                    buffered = BytesIO()
-                    cropped_image.save(buffered, format="JPEG")
-                    img_base64 = base64.b64encode(buffered.getvalue())
-                    img_base64_str = img_base64.decode()
-                    el.metadata.image_base64 = img_base64_str
-                    el.metadata.image_mime_type = "image/jpeg"
-                else:
-                    write_image(cropped_image, output_f_path)
-                    # add image path to element metadata
-                    el.metadata.image_path = output_f_path
+                try:
+                    cropped_image = image.crop(padded_bbox)
+                finally:
+                    image.close()
+                try:
+                    # PNG images with transparency need conversion before JPEG encoding.
+                    if cropped_image.mode == "RGBA":
+                        converted_image = cropped_image.convert("RGB")
+                        cropped_image.close()
+                        cropped_image = converted_image
+
+                    if extract_image_block_to_payload:
+                        with BytesIO() as buffered:
+                            cropped_image.save(buffered, format="JPEG")
+                            el.metadata.image_base64 = base64.b64encode(
+                                buffered.getvalue()
+                            ).decode()
+                        el.metadata.image_mime_type = "image/jpeg"
+                    else:
+                        basename = "table" if el.category == ElementType.TABLE else "figure"
+                        assert output_dir_path
+                        output_f_path = os.path.join(
+                            output_dir_path,
+                            f"{basename}-{metadata_page_number}-{figure_number}.jpg",
+                        )
+                        write_image(cropped_image, output_f_path)
+                        el.metadata.image_path = output_f_path
+                finally:
+                    cropped_image.close()
             except (ValueError, IOError):
                 logger.warning("Image Extraction Error: Skipping the failed image", exc_info=True)
 
@@ -224,11 +256,13 @@ def check_element_types_to_extract(
             "ex. ['Table', 'Image']",
         )
 
-    available_element_types = list(ElementType.to_dict().values())
+    available_element_types = {e_type.lower(): e_type for e_type in ElementType.to_dict().values()}
     normalized_extract_image_block_types = []
     for el_type in extract_image_block_types:
-        normalized_el_type = el_type.lower().capitalize()
-        if normalized_el_type not in available_element_types:
+        normalized_el_type = available_element_types.get(
+            el_type.lower(), el_type.lower().capitalize()
+        )
+        if normalized_el_type not in available_element_types.values():
             logger.warning(f"The requested type ({el_type}) doesn't match any available type")
         normalized_extract_image_block_types.append(normalized_el_type)
 
@@ -338,11 +372,11 @@ def annotate_layout_elements(
                 )
         else:
             with tempfile.TemporaryDirectory() as temp_dir:
-                _image_paths = pdf2image.convert_from_path(
+                _image_paths = convert_pdf_to_image(
                     filename,
                     dpi=pdf_image_dpi,
                     output_folder=temp_dir,
-                    paths_only=True,
+                    path_only=True,
                 )
                 image_paths = cast(List[str], _image_paths)
                 for i, image_path in enumerate(image_paths):
@@ -378,49 +412,59 @@ def convert_pdf_to_images(
     filename: str = "",
     file: Optional[bytes | IO[bytes]] = None,
     chunk_size: int = 10,
+    password: Optional[str] = None,
 ) -> Iterator[Image.Image]:
-    # Convert a PDF in small chunks of pages at a time (e.g. 1-10, 11-20... and so on)
+    """Yield owned page images without retaining the upload or a batch of decoded pages."""
     exactly_one(filename=filename, file=file)
-    if file is not None:
-        f_bytes = convert_to_bytes(file)
-        info = pdf2image.pdfinfo_from_bytes(f_bytes)
-    else:
-        f_bytes = None
-        info = pdf2image.pdfinfo_from_path(filename)
-
-    total_pages = info["Pages"]
-    for start_page in range(1, total_pages + 1, chunk_size):
-        end_page = min(start_page + chunk_size - 1, total_pages)
-        if f_bytes is not None:
-            chunk_images = pdf2image.convert_from_bytes(
-                f_bytes,
-                first_page=start_page,
-                last_page=end_page,
-            )
-        else:
-            chunk_images = pdf2image.convert_from_path(
-                filename,
-                first_page=start_page,
-                last_page=end_page,
-            )
-
-        for image in chunk_images:
-            yield image
+    with _pdf_source_path(filename, file) as source_path:
+        total_pages = pdf2image.pdfinfo_from_path(source_path, userpw=password)["Pages"]
+        for page_number in range(1, total_pages + 1):
+            try:
+                images = render_pdf_to_image(
+                    filename=source_path,
+                    dpi=env_config.PDF_RENDER_DPI,
+                    first_page=page_number,
+                    last_page=page_number,
+                    password=password,
+                    pdf_render_max_pixels_per_page=env_config.PDF_RENDER_MAX_PIXELS_PER_PAGE,
+                )
+            except PdfRenderTooLargeError as exc:
+                raise UnprocessableEntityError(str(exc)) from exc
+            # The caller owns the yielded image and may retain it after iteration.
+            yield from cast(List[Image.Image], images)
+            del images
 
 
-def get_the_last_modification_date_pdf_or_img(
-    file: Optional[bytes | IO[bytes]] = None,
-    filename: Optional[str] = "",
-    date_from_file_object: bool = False,
-) -> str | None:
-    last_modification_date = None
-    if not file and filename:
-        last_modification_date = get_last_modified_date(filename=filename)
-    elif not filename and file:
-        last_modification_date = (
-            get_last_modified_date_from_file(file) if date_from_file_object else None
-        )
-    return last_modification_date
+@contextmanager
+def _pdf_source_path(filename: str, file: Optional[bytes | IO[bytes]]) -> Iterator[str]:
+    """Yield a filesystem path for `filename` or a temporary on-disk copy of `file`.
+
+    Any readable, seekable `file` is accepted. A `BytesIO` cursor is restored after the copy and
+    other streams are left rewound; buffered files with a path name are re-read from that path.
+    """
+    if file is None:
+        yield filename
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "upload.pdf")
+        with open(path, "wb") as destination:
+            if isinstance(file, bytes):
+                copy_file_to_stream(file, destination)
+            elif isinstance(file, (TextIOWrapper, BufferedReader)) and isinstance(
+                getattr(file, "name", None), (str, bytes, os.PathLike)
+            ):
+                with open(file.name, "rb") as source:
+                    copy_file_to_stream(source, destination)
+            elif callable(getattr(file, "read", None)) and callable(getattr(file, "seek", None)):
+                position = file.tell() if isinstance(file, BytesIO) else 0
+                try:
+                    file.seek(0)
+                    copy_file_to_stream(file, destination)
+                finally:
+                    file.seek(position)
+            else:
+                raise ValueError("Invalid file-like object type")
+        yield path
 
 
 def remove_control_characters(text: str) -> str:

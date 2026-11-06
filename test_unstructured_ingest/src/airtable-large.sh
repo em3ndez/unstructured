@@ -38,7 +38,7 @@ fi
 # shellcheck disable=SC1091
 source ./scripts/airtable-test-helpers/component_ids.sh
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   airtable \
   --download-dir "$DOWNLOAD_DIR" \
@@ -48,8 +48,9 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --num-processes "$max_processes" \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 # We are expecting fifteen directories: fourteen bases and the parent directory
 "$SCRIPT_DIR"/check-num-dirs-output.sh 15 "$OUTPUT_FOLDER_NAME"

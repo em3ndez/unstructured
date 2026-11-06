@@ -11,10 +11,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -22,7 +23,7 @@
     }
   },
   {
-    "type": "Title",
+    "type": "UncategorizedText",
     "element_id": "5209312022a75a31d95385fdccff68fa",
     "text": "CHAPTER 1",
     "metadata": {
@@ -38,10 +39,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -49,7 +51,7 @@
     }
   },
   {
-    "type": "Title",
+    "type": "UncategorizedText",
     "element_id": "22a23e29022f32945965002cd734a8f0",
     "text": "INTRODUCTION",
     "metadata": {
@@ -65,10 +67,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -76,7 +79,7 @@
     }
   },
   {
-    "type": "Title",
+    "type": "UncategorizedText",
     "element_id": "4c175cf543957acc4420221de28d3fca",
     "text": "CHAPTER 1 \u2013 INTRODUCTION",
     "metadata": {
@@ -86,10 +89,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -97,7 +101,7 @@
     }
   },
   {
-    "type": "Title",
+    "type": "UncategorizedText",
     "element_id": "77022a5264f552b223538977cd40f640",
     "text": "A.\tPURPOSE",
     "metadata": {
@@ -107,10 +111,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -128,10 +133,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -149,10 +155,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -170,10 +177,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -181,7 +189,7 @@
     }
   },
   {
-    "type": "Title",
+    "type": "UncategorizedText",
     "element_id": "e341ffc123dd2827638aba18149c4175",
     "text": "B.\tROLE OF THE UNITED STATES TRUSTEE",
     "metadata": {
@@ -191,10 +199,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -212,10 +221,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -233,10 +243,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -244,7 +255,7 @@
     }
   },
   {
-    "type": "Title",
+    "type": "UncategorizedText",
     "element_id": "1b11ebe52652656e0ed8c12e5969de9b",
     "text": "C.\tSTATUTORY DUTIES OF A STANDING TRUSTEE\t",
     "metadata": {
@@ -254,10 +265,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -275,10 +287,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -296,10 +309,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"
@@ -318,10 +332,11 @@
       "filetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "data_source": {
         "url": "box:///utic-test-ingest-fixtures/handbook-1p.docx",
-        "version": "83125548004193369404829885052395764226",
+        "version": "1255888824139",
         "record_locator": {
           "protocol": "box",
-          "remote_file_path": "box://utic-test-ingest-fixtures"
+          "remote_file_path": "box://utic-test-ingest-fixtures",
+          "file_id": "1255888824139"
         },
         "date_created": "1688874451.0",
         "date_modified": "1688874451.0"

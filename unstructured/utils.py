@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import functools
-import html
+import asyncio
+import contextlib
 import importlib
 import inspect
 import json
@@ -10,19 +10,17 @@ import platform
 import subprocess
 import tempfile
 import threading
-from datetime import datetime
-from functools import wraps
+from functools import lru_cache, wraps
 from itertools import combinations
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Generic,
     Iterable,
     Iterator,
     List,
     Optional,
-    Sequence,
     Tuple,
     TypeVar,
     cast,
@@ -61,152 +59,16 @@ def get_call_args_applying_defaults(
     return call_args
 
 
-def htmlify_matrix_of_cell_texts(matrix: Sequence[Sequence[str]]) -> str:
-    """Form an HTML table from "rows" and "columns" of `matrix`.
-
-    Character overhead is minimized:
-    - No whitespace padding is added for human readability
-    - No newlines ("\n") are added
-    - No `<thead>`, `<tbody>`, or `<tfoot>` elements are used; we can't tell where those might be
-      semantically appropriate anyway so at best they would consume unnecessary space and at worst
-      would be misleading.
-    """
-
-    def iter_trs(rows_of_cell_strs: Sequence[Sequence[str]]) -> Iterator[str]:
-        for row_cell_strs in rows_of_cell_strs:
-            # -- suppress emission of rows with no cells --
-            if not row_cell_strs:
-                continue
-            yield f"<tr>{''.join(iter_tds(row_cell_strs))}</tr>"
-
-    def iter_tds(row_cell_strs: Sequence[str]) -> Iterator[str]:
-        for s in row_cell_strs:
-            # -- take care of things like '<' and '>' in the text --
-            s = html.escape(s)
-            # -- substitute <br/> elements for line-feeds in the text --
-            s = "<br/>".join(s.split("\n"))
-            # -- strip leading and trailing whitespace, wrap it up and go --
-            yield f"<td>{s.strip()}</td>"
-
-    return f"<table>{''.join(iter_trs(matrix))}</table>" if matrix else ""
-
-
 def is_temp_file_path(file_path: str) -> bool:
     """True when file_path is in the Python-defined tempdir.
 
     The Python-defined temp directory is platform dependent (macOS != Linux != Windows)
     and can also be determined by an environment variable (TMPDIR, TEMP, or TMP).
     """
-    return file_path.startswith(tempfile.gettempdir())
-
-
-class lazyproperty(Generic[_T]):
-    """Decorator like @property, but evaluated only on first access.
-
-    Like @property, this can only be used to decorate methods having only a `self` parameter, and
-    is accessed like an attribute on an instance, i.e. trailing parentheses are not used. Unlike
-    @property, the decorated method is only evaluated on first access; the resulting value is
-    cached and that same value returned on second and later access without re-evaluation of the
-    method.
-
-    Like @property, this class produces a *data descriptor* object, which is stored in the __dict__
-    of the *class* under the name of the decorated method ('fget' nominally). The cached value is
-    stored in the __dict__ of the *instance* under that same name.
-
-    Because it is a data descriptor (as opposed to a *non-data descriptor*), its `__get__()` method
-    is executed on each access of the decorated attribute; the __dict__ item of the same name is
-    "shadowed" by the descriptor.
-
-    While this may represent a performance improvement over a property, its greater benefit may be
-    its other characteristics. One common use is to construct collaborator objects, removing that
-    "real work" from the constructor, while still only executing once. It also de-couples client
-    code from any sequencing considerations; if it's accessed from more than one location, it's
-    assured it will be ready whenever needed.
-
-    Loosely based on: https://stackoverflow.com/a/6849299/1902513.
-
-    A lazyproperty is read-only. There is no counterpart to the optional "setter" (or deleter)
-    behavior of an @property. This is critically important to maintaining its immutability and
-    idempotence guarantees. Attempting to assign to a lazyproperty raises AttributeError
-    unconditionally.
-
-    The parameter names in the methods below correspond to this usage example::
-
-        class Obj(object)
-
-            @lazyproperty
-            def fget(self):
-                return 'some result'
-
-        obj = Obj()
-
-    Not suitable for wrapping a function (as opposed to a method) because it is not callable.
-    """
-
-    def __init__(self, fget: Callable[..., _T]) -> None:
-        """*fget* is the decorated method (a "getter" function).
-
-        A lazyproperty is read-only, so there is only an *fget* function (a regular
-        @property can also have an fset and fdel function). This name was chosen for
-        consistency with Python's `property` class which uses this name for the
-        corresponding parameter.
-        """
-        # --- maintain a reference to the wrapped getter method
-        self._fget = fget
-        # --- and store the name of that decorated method
-        self._name = fget.__name__
-        # --- adopt fget's __name__, __doc__, and other attributes
-        functools.update_wrapper(self, fget)  # pyright: ignore
-
-    def __get__(self, obj: Any, type: Any = None) -> _T:
-        """Called on each access of 'fget' attribute on class or instance.
-
-        *self* is this instance of a lazyproperty descriptor "wrapping" the property
-        method it decorates (`fget`, nominally).
-
-        *obj* is the "host" object instance when the attribute is accessed from an
-        object instance, e.g. `obj = Obj(); obj.fget`. *obj* is None when accessed on
-        the class, e.g. `Obj.fget`.
-
-        *type* is the class hosting the decorated getter method (`fget`) on both class
-        and instance attribute access.
-        """
-        # --- when accessed on class, e.g. Obj.fget, just return this descriptor
-        # --- instance (patched above to look like fget).
-        if obj is None:
-            return self  # type: ignore
-
-        # --- when accessed on instance, start by checking instance __dict__ for
-        # --- item with key matching the wrapped function's name
-        value = obj.__dict__.get(self._name)
-        if value is None:
-            # --- on first access, the __dict__ item will be absent. Evaluate fget()
-            # --- and store that value in the (otherwise unused) host-object
-            # --- __dict__ value of same name ('fget' nominally)
-            value = self._fget(obj)
-            obj.__dict__[self._name] = value
-        return cast(_T, value)
-
-    def __set__(self, obj: Any, value: Any) -> None:
-        """Raises unconditionally, to preserve read-only behavior.
-
-        This decorator is intended to implement immutable (and idempotent) object
-        attributes. For that reason, assignment to this property must be explicitly
-        prevented.
-
-        If this __set__ method was not present, this descriptor would become a
-        *non-data descriptor*. That would be nice because the cached value would be
-        accessed directly once set (__dict__ attrs have precedence over non-data
-        descriptors on instance attribute lookup). The problem is, there would be
-        nothing to stop assignment to the cached value, which would overwrite the result
-        of `fget()` and break both the immutability and idempotence guarantees of this
-        decorator.
-
-        The performance with this __set__() method in place was roughly 0.4 usec per
-        access when measured on a 2.8GHz development machine; so quite snappy and
-        probably not a rich target for optimization efforts.
-        """
-        raise AttributeError("can't set attribute")
+    # -- Compare path components, not a raw string prefix: `startswith()` also matches a
+    # -- path that merely begins with the temp-dir name, e.g. "/tmpdata/report.csv" when
+    # -- the temp dir is "/tmp", which would drop `filename`/`last_modified` metadata.
+    return Path(file_path).is_relative_to(tempfile.gettempdir())
 
 
 def save_as_jsonl(data: list[dict[str, Any]], filename: str) -> None:
@@ -219,6 +81,24 @@ def read_from_jsonl(filename: str) -> list[dict[str, Any]]:
         return [json.loads(line) for line in input_file]
 
 
+def _reject_json_constant(constant: str) -> None:
+    """Raise so `NaN`/`Infinity`/`-Infinity` are treated as malformed JSON.
+
+    Raised as `JSONDecodeError` so it flows through callers' existing decode-error handling and
+    surfaces as the canonical "Not a valid json"/"Not a valid ndjson" ValueError.
+    """
+    raise json.JSONDecodeError(f"Non-standard JSON constant: {constant}", constant, 0)
+
+
+def loads_strict_json(text: str) -> Any:
+    """`json.loads` that rejects the non-standard constants Python accepts by default.
+
+    Lives here (a low-level module) so both `file_utils.filetype` and
+    `partition.common.json_partitioning` can share it without an import cycle.
+    """
+    return json.loads(text, parse_constant=_reject_json_constant)
+
+
 def requires_dependencies(
     dependencies: str | list[str],
     extras: Optional[str] = None,
@@ -227,8 +107,7 @@ def requires_dependencies(
         dependencies = [dependencies]
 
     def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
-        @wraps(func)
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs):
+        def run_check():
             missing_deps: List[str] = []
             for dep in dependencies:
                 if not dependency_exists(dep):
@@ -242,13 +121,25 @@ def requires_dependencies(
                         else f"Please install them using `pip install {' '.join(missing_deps)}`."
                     ),
                 )
+
+        @wraps(func)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs):
+            run_check()
             return func(*args, **kwargs)
 
+        @wraps(func)
+        async def wrapper_async(*args: _P.args, **kwargs: _P.kwargs):
+            run_check()
+            return await func(*args, **kwargs)
+
+        if asyncio.iscoroutinefunction(func):
+            return wrapper_async
         return wrapper
 
     return decorator
 
 
+@lru_cache(maxsize=128)
 def dependency_exists(dependency: str):
     try:
         importlib.import_module(dependency)
@@ -257,36 +148,6 @@ def dependency_exists(dependency: str):
         if dependency in repr(e):
             return False
     return True
-
-
-def validate_date_args(date: Optional[str] = None) -> bool:
-    """Validate whether the provided date string satisfies any of the supported date formats.
-
-    Used by unstructured/ingest/connector/biomed.py
-
-    Returns `True` if the date string satisfies any of the supported formats, otherwise raises
-    `ValueError`.
-
-    Supported Date Formats:
-        - 'YYYY-MM-DD'
-        - 'YYYY-MM-DDTHH:MM:SS'
-        - 'YYYY-MM-DD+HH:MM:SS'
-        - 'YYYY-MM-DDTHH:MM:SS±HHMM'
-    """
-    if not date:
-        raise ValueError("The argument date is None.")
-
-    for format in DATE_FORMATS:
-        try:
-            datetime.strptime(date, format)
-            return True
-        except ValueError:
-            pass
-
-    raise ValueError(
-        f"The argument {date} does not satisfy the format:"
-        f" YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD+HH:MM:SS or YYYY-MM-DDTHH:MM:SS±HHMM",
-    )
 
 
 def _first_and_remaining_iterator(it: Iterable[_T]) -> Tuple[_T, Iterator[_T]]:
@@ -320,59 +181,64 @@ def only(it: Iterable[Any]) -> Any:
     return out
 
 
+_NVIDIA_SMI_TIMEOUT_SECONDS = 1.0
+
+
+def _telemetry_opt_out() -> bool:
+    """True if telemetry should be disabled via env.
+
+    DO_NOT_TRACK and SCARF_NO_ANALYTICS both follow the same rule: any non-empty
+    value (after strip) opts out. See README/CHANGELOG for the public contract.
+    """
+    return bool((os.getenv("DO_NOT_TRACK") or "").strip()) or bool(
+        (os.getenv("SCARF_NO_ANALYTICS") or "").strip()
+    )
+
+
 def scarf_analytics():
+    """Send a lightweight library-load analytics ping unless it is opted out.
+
+    Opt-out env vars (DO_NOT_TRACK, SCARF_NO_ANALYTICS): any non-empty value opts out.
+    """
+    if _telemetry_opt_out():
+        return
+
     try:
-        subprocess.check_output("nvidia-smi")
+        subprocess.run(
+            ["nvidia-smi"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=_NVIDIA_SMI_TIMEOUT_SECONDS,
+        )
         gpu_present = True
-    except Exception:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         gpu_present = False
 
     python_version = ".".join(platform.python_version().split(".")[:2])
 
-    try:
-        if os.getenv("SCARF_NO_ANALYTICS") != "true" and os.getenv("DO_NOT_TRACK") != "true":
-            if "dev" in __version__:
-                requests.get(
-                    "https://packages.unstructured.io/python-telemetry?version="
-                    + __version__
-                    + "&platform="
-                    + platform.system()
-                    + "&python"
-                    + python_version
-                    + "&arch="
-                    + platform.machine()
-                    + "&gpu="
-                    + str(gpu_present)
-                    + "&dev=true",
-                )
-            else:
-                requests.get(
-                    "https://packages.unstructured.io/python-telemetry?version="
-                    + __version__
-                    + "&platform="
-                    + platform.system()
-                    + "&python"
-                    + python_version
-                    + "&arch="
-                    + platform.machine()
-                    + "&gpu="
-                    + str(gpu_present)
-                    + "&dev=false",
-                )
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        requests.get(
+            "https://packages.unstructured.io/python-telemetry",
+            params={
+                "version": __version__,
+                "platform": platform.system(),
+                "python": python_version,
+                "arch": platform.machine(),
+                "gpu": str(gpu_present),
+                "dev": str("dev" in __version__).lower(),
+            },
+            timeout=10,
+        )
 
 
 def ngrams(s: list[str], n: int) -> list[tuple[str, ...]]:
     """Generate n-grams from a list of strings where `n` (int) is the size of each n-gram."""
 
-    ngrams_list: list[tuple[str, ...]] = []
-    for i in range(len(s) - n + 1):
-        ngram: list[str] = []
-        for j in range(n):
-            ngram.append(s[i + j])
-        ngrams_list.append(tuple(ngram))
-    return ngrams_list
+    if n <= 0:
+        raise ValueError(f"n must be positive, received n = {n}")
+    return [tuple(s[i : i + n]) for i in range(len(s) - n + 1)]
 
 
 def calculate_shared_ngram_percentage(
@@ -433,9 +299,9 @@ def is_parent_box(parent_target: Box, child_target: Box, add: float = 0.0) -> bo
     """
     if len(parent_target) != 4:
         return False
-    parent_targets = [0, 0, 0, 0]
-    if add and len(parent_target) == 4:
-        parent_targets = list(parent_target)
+    # Zero tolerance is exact containment. Leave the parent coordinates in place.
+    parent_targets = list(parent_target)
+    if add:
         parent_targets[0] -= add
         parent_targets[1] -= add
         parent_targets[2] += add
@@ -447,12 +313,10 @@ def is_parent_box(parent_target: Box, child_target: Box, add: float = 0.0) -> bo
         and (child_target[2] <= parent_targets[2] and child_target[3] <= parent_targets[3])
     ):
         return True
-    if len(child_target) == 2 and (
+    return len(child_target) == 2 and (
         parent_targets[0] <= child_target[0] <= parent_targets[2]
         and parent_targets[1] <= child_target[1] <= parent_targets[3]
-    ):
-        return True
-    return False
+    )
 
 
 def calculate_overlap_percentage(
@@ -540,7 +404,7 @@ def identify_overlapping_case(
     type1, type2 = label_pair
     text1, text2 = text_pair
     ix_element1, ix_element2 = ix_pair
-    (overlap_percentage, max_area, min_area, total_area) = calculate_overlap_percentage(
+    overlap_percentage, max_area, min_area, total_area = calculate_overlap_percentage(
         box1,
         box2,
         intersection_ratio_method="partial",
@@ -640,8 +504,9 @@ def identify_overlapping_or_nesting_case(
     type1, type2 = label_pair
     ix_element1 = "".join([ch for ch in type1 if ch.isnumeric()])
     ix_element2 = "".join([ch for ch in type2 if ch.isnumeric()])
-    type1 = type1[3:].strip()
-    type2 = type2[3:].strip()
+    # Labels are "{ix}. {category}", and ix can have any number of digits.
+    type1 = type1.split(". ", 1)[-1]
+    type2 = type2.split(". ", 1)[-1]
     box1_corners = _convert_coordinates_to_box(box1)
     box2_corners = _convert_coordinates_to_box(box2)
     x_bottom_left_1, y_bottom_left_1, x_top_right_1, y_top_right_1 = box1_corners
@@ -732,7 +597,10 @@ def catch_overlapping_and_nested_bboxes(
 ) -> tuple[bool, list[dict[str, Any]]]:
     """Catch overlapping and nested bounding boxes cases across a list of elements."""
 
-    num_pages = elements[-1].metadata.page_number or 0
+    # -- page-numbers are 1-based and an element without one is on page 1, like the per-element
+    # -- default below, so an empty element-list has no pages to compare and every element above
+    # -- page 1 gets its own page-bucket --
+    num_pages = max((element.metadata.page_number or 1 for element in elements), default=0)
     pages_of_bboxes: list[list[Points]] = [[] for _ in range(num_pages)]
 
     text_labels: list[list[str]] = [[] for _ in range(num_pages)]
@@ -799,6 +667,50 @@ def catch_overlapping_and_nested_bboxes(
                 document_with_overlapping_flag = True
 
     return document_with_overlapping_flag, overlapping_cases
+
+
+def group_elements_by_parent_id(
+    elements: Iterable["Element"],
+    assign_orphans: bool = False,
+) -> dict[Optional[str], list["Element"]]:
+    """Group elements by their parent_id metadata field.
+
+    Elements with the same parent_id are grouped together.
+
+    Args:
+        elements: An iterable of Element objects to group.
+        assign_orphans: If True, elements with no parent_id (None) will be assigned to
+            the same group as the previous element. If False (default), elements with
+            no parent are grouped under the None key.
+
+    Returns:
+        A dictionary mapping parent_id values to lists of elements sharing that parent_id.
+
+    Example:
+        >>> elements = partition("example.pdf")
+        >>> grouped = group_elements_by_parent_id(elements)
+        >>> for parent_id, children in grouped.items():
+        ...     print(f"Parent {parent_id}: {len(children)} children")
+
+        >>> # Assign orphan elements to previous element's group
+        >>> grouped = group_elements_by_parent_id(elements, assign_orphans=True)
+    """
+    from collections import defaultdict
+
+    groups: dict[Optional[str], list["Element"]] = defaultdict(list)
+    last_parent_id: Optional[str] = None
+
+    for element in elements:
+        parent_id = getattr(element.metadata, "parent_id", None)
+
+        if parent_id is None and assign_orphans:
+            parent_id = last_parent_id
+        elif parent_id is not None:
+            last_parent_id = parent_id
+
+        groups[parent_id].append(element)
+
+    return dict(groups)
 
 
 class FileHandler:

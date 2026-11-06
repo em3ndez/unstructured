@@ -1,494 +1,118 @@
+"""Automatically detect file-type based on inspection of the file's contents.
+
+Auto-detection proceeds via a sequence of strategies. The first strategy to confidently determine a
+file-type returns that value. A strategy that is not applicable, either because it lacks the input
+required or fails to determine a file-type, returns `None` and execution continues with the next
+strategy.
+
+`_FileTypeDetector` is the main object and implements the three strategies.
+
+The three strategies are:
+
+- Use MIME-type asserted by caller in the `content_type` argument.
+- Guess a MIME-type using libmagic, falling back to the `filetype` package when libmagic is
+  unavailable.
+- Map filename-extension to a `FileType` member.
+
+A file that fails all three strategies is assigned the value `FileType.UNK`, for "unknown".
+
+`_FileTypeDetectionContext` encapsulates the various arguments received by `detect_filetype()` and
+provides values derived from them. This object is immutable and can be passed to delegates of
+`_FileTypeDetector` to provide whatever context they need on the current detection instance.
+
+`_FileTypeDetector` delegates to _differentiator_ objects like `_ZipFileDifferentiator` for
+specialized discrimination and/or confirmation of ambiguous or frequently mis-identified
+MIME-types. Additional differentiators are planned, one for `application/x-ole-storage`
+(DOC, PPT, XLS, and MSG file-types) and perhaps others.
+"""
+
 from __future__ import annotations
 
-import enum
+import codecs
+import contextlib
 import functools
+import importlib.util
 import json
 import os
 import re
+import tempfile
+import warnings
 import zipfile
-from typing import IO, Callable, List, Optional
+from functools import cached_property
+from typing import IO, Callable, Iterator, Optional, cast
 
+import filetype as ft
+from olefile import OleFileIO
+from oxmsg.storage import Storage
 from typing_extensions import ParamSpec
 
 from unstructured.documents.elements import Element
 from unstructured.file_utils.encoding import detect_file_encoding, format_encoding_str
-from unstructured.nlp.patterns import LIST_OF_DICTS_PATTERN
-from unstructured.partition.common import (
-    add_element_metadata,
-    exactly_one,
-    remove_element_metadata,
-    set_element_hierarchy,
-)
-from unstructured.utils import get_call_args_applying_defaults
+from unstructured.file_utils.model import FileType
+from unstructured.logger import logger
+from unstructured.nlp.patterns import EMAIL_HEAD_RE, LIST_OF_DICTS_PATTERN
+from unstructured.partition.common.common import add_element_metadata, exactly_one
+from unstructured.partition.common.metadata import set_element_hierarchy
+from unstructured.utils import get_call_args_applying_defaults, loads_strict_json
+
+_JSON_DISAMBIGUATION_CHUNK_SIZE = 8192
+_JSON_DISAMBIGUATION_MAX_CHARS = 1024 * 1024
 
 try:
-    import magic
-
+    importlib.import_module("magic")
     LIBMAGIC_AVAILABLE = True
-except ImportError:  # pragma: nocover
-    LIBMAGIC_AVAILABLE = False  # pragma: nocover
-
-from unstructured.logger import logger
-from unstructured.nlp.patterns import EMAIL_HEAD_RE
-
-TXT_MIME_TYPES = [
-    "text/plain",
-    "message/rfc822",  # ref: https://www.rfc-editor.org/rfc/rfc822
-]
-
-# NOTE(robinson) - .docx.xlsx files are actually zip file with a .docx/.xslx extension.
-# If the MIME type is application/octet-stream, we check if it's a .docx/.xlsx file by
-# looking for expected filenames within the zip file.
-EXPECTED_DOCX_FILES = [
-    "docProps/core.xml",
-    "word/document.xml",
-]
-
-EXPECTED_XLSX_FILES = [
-    "xl/workbook.xml",
-]
-
-EXPECTED_PPTX_FILES = [
-    "docProps/core.xml",
-    "ppt/presentation.xml",
-]
-
-
-class FileType(enum.Enum):
-    UNK = 0
-    EMPTY = 1
-
-    # MS Office Types
-    DOC = 10
-    DOCX = 11
-    XLS = 12
-    XLSX = 13
-    PPT = 14
-    PPTX = 15
-    MSG = 16
-
-    # Adobe Types
-    PDF = 20
-
-    # Image Types
-    JPG = 30
-    PNG = 31
-    TIFF = 32
-    BMP = 33
-    HEIC = 34
-
-    # Plain Text Types
-    EML = 40
-    RTF = 41
-    TXT = 42
-    JSON = 43
-    CSV = 44
-    TSV = 45
-
-    # Markup Types
-    HTML = 50
-    XML = 51
-    MD = 52
-    EPUB = 53
-    RST = 54
-    ORG = 55
-
-    # Compressed Types
-    ZIP = 60
-
-    # Open Office Types
-    ODT = 70
-
-    # Audio Files
-    WAV = 80
-
-    # NOTE(robinson) - This is to support sorting for pandas groupby functions
-    def __lt__(self, other):
-        return self.name < other.name
-
-
-STR_TO_FILETYPE = {
-    "application/pdf": FileType.PDF,
-    "application/msword": FileType.DOC,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": FileType.DOCX,
-    "image/jpeg": FileType.JPG,
-    "image/png": FileType.PNG,
-    "image/heic": FileType.HEIC,
-    "image/tiff": FileType.TIFF,
-    "image/bmp": FileType.BMP,
-    # NOTE(robinson) - https://mimetype.io/application/yaml
-    # In the future, we may have special processing for YAML
-    # files instead of treating them as plaintext
-    "application/yaml": FileType.TXT,
-    "application/x-yaml": FileType.TXT,
-    "text/x-yaml": FileType.TXT,
-    "text/yaml": FileType.TXT,
-    "text/plain": FileType.TXT,
-    "text/x-csv": FileType.CSV,
-    "application/csv": FileType.CSV,
-    "application/x-csv": FileType.CSV,
-    "text/comma-separated-values": FileType.CSV,
-    "text/x-comma-separated-values": FileType.CSV,
-    "text/csv": FileType.CSV,
-    "text/tsv": FileType.TSV,
-    "text/markdown": FileType.MD,
-    "text/x-markdown": FileType.MD,
-    "text/org": FileType.ORG,
-    "text/x-rst": FileType.RST,
-    "application/epub": FileType.EPUB,
-    "application/epub+zip": FileType.EPUB,
-    "application/json": FileType.JSON,
-    "application/rtf": FileType.RTF,
-    "text/rtf": FileType.RTF,
-    "text/html": FileType.HTML,
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": FileType.XLSX,
-    "application/vnd.ms-excel": FileType.XLS,
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": FileType.PPTX,
-    "application/vnd.ms-powerpoint": FileType.PPT,
-    "application/xml": FileType.XML,
-    "application/vnd.oasis.opendocument.text": FileType.ODT,
-    "message/rfc822": FileType.EML,
-    "application/x-ole-storage": FileType.MSG,
-    "application/vnd.ms-outlook": FileType.MSG,
-    # NOTE(robinson) - https://mimetype.io/audio/wav
-    "audio/vnd.wav": FileType.WAV,
-    "audio/vnd.wave": FileType.WAV,
-    "audio/wave": FileType.WAV,
-    "audio/x-pn-wav": FileType.WAV,
-    "audio/x-wav": FileType.WAV,
-    "inode/x-empty": FileType.EMPTY,
-}
-
-MIMETYPES_TO_EXCLUDE = [
-    "text/x-markdown",
-    "application/epub+zip",
-    "text/x-csv",
-    "application/csv",
-    "application/x-csv",
-    "text/comma-separated-values",
-    "text/x-comma-separated-values",
-]
-
-FILETYPE_TO_MIMETYPE = {v: k for k, v in STR_TO_FILETYPE.items() if k not in MIMETYPES_TO_EXCLUDE}
-
-EXT_TO_FILETYPE = {
-    ".pdf": FileType.PDF,
-    ".docx": FileType.DOCX,
-    ".jpg": FileType.JPG,
-    ".jpeg": FileType.JPG,
-    ".txt": FileType.TXT,
-    ".text": FileType.TXT,
-    ".log": FileType.TXT,
-    ".eml": FileType.EML,
-    ".xml": FileType.XML,
-    ".heic": FileType.HEIC,
-    ".htm": FileType.HTML,
-    ".html": FileType.HTML,
-    ".md": FileType.MD,
-    ".org": FileType.ORG,
-    ".rst": FileType.RST,
-    ".xlsx": FileType.XLSX,
-    ".pptx": FileType.PPTX,
-    ".p7s": FileType.EML,
-    ".png": FileType.PNG,
-    ".doc": FileType.DOC,
-    ".zip": FileType.ZIP,
-    ".xls": FileType.XLS,
-    ".ppt": FileType.PPT,
-    ".rtf": FileType.RTF,
-    ".json": FileType.JSON,
-    ".epub": FileType.EPUB,
-    ".msg": FileType.MSG,
-    ".odt": FileType.ODT,
-    ".csv": FileType.CSV,
-    ".tsv": FileType.TSV,
-    ".tab": FileType.TSV,
-    ".tiff": FileType.TIFF,
-    ".bmp": FileType.BMP,
-    ".wav": FileType.WAV,
-    # NOTE(robinson) - for now we are treating code files as plain text
-    ".js": FileType.TXT,
-    ".py": FileType.TXT,
-    ".java": FileType.TXT,
-    ".cpp": FileType.TXT,
-    ".cc": FileType.TXT,
-    ".cxx": FileType.TXT,
-    ".c": FileType.TXT,
-    ".cs": FileType.TXT,
-    ".php": FileType.TXT,
-    ".rb": FileType.TXT,
-    ".swift": FileType.TXT,
-    ".ts": FileType.TXT,
-    ".go": FileType.TXT,
-    ".yaml": FileType.TXT,
-    ".yml": FileType.TXT,
-    None: FileType.UNK,
-}
-
-PLAIN_TEXT_EXTENSIONS = [
-    ".txt",
-    ".text",
-    ".eml",
-    ".p7s",
-    ".md",
-    ".rtf",
-    ".html",
-    ".rst",
-    ".org",
-    ".csv",
-    ".tsv",
-    ".tab",
-    ".json",
-]
-
-
-def _resolve_symlink(file_path):
-    # Resolve the symlink to get the actual file path
-    if os.path.islink(file_path):
-        file_path = os.path.realpath(file_path)
-    return file_path
+except ImportError:
+    LIBMAGIC_AVAILABLE = False  # pyright: ignore[reportConstantRedefinition]
 
 
 def detect_filetype(
-    filename: Optional[str] = None,
-    content_type: Optional[str] = None,
-    file: Optional[IO[bytes]] = None,
-    file_filename: Optional[str] = None,
-    encoding: Optional[str] = "utf-8",
-) -> Optional[FileType]:
-    """Use libmagic to determine a file's type. Helps determine which partition brick
-    to use for a given file. A return value of None indicates a non-supported file type.
+    file_path: str | None = None,
+    file: IO[bytes] | tempfile.SpooledTemporaryFile | None = None,
+    encoding: str | None = None,
+    content_type: str | None = None,
+    metadata_file_path: Optional[str] = None,
+) -> FileType:
+    """Determine file-type of specified file using libmagic and/or fallback methods.
+
+    One of `file_path` or `file` must be specified. A `file_path` that does not
+    correspond to a file on the filesystem raises `ValueError`. JSON/NDJSON
+    disambiguation examines at most the first 1 MiB of the file.
+
+    Args:
+        content_type: MIME-type of document-source, when already known. Providing
+          a value for this argument disables auto-detection unless it does not map
+          to a FileType member or is ambiguous, in which case it is ignored.
+        encoding: Only used for textual file-types. When omitted, `utf-8` is
+          assumed. Should generally be omitted except to resolve a problem with
+          textual file-types like HTML.
+        metadata_file_path: Only used when `file` is provided and then only as a
+          source for a filename-extension that may be needed as a secondary
+          content-type indicator. Ignored with the document is specified using
+          `file_path`.
+
+    Returns:
+        A member of the `FileType` enumeration, `FileType.UNK` when the file type
+        could not be determined or is not supported.
+
+    Raises:
+        ValueError: when:
+        - `file_path` is specified but does not correspond to a file on the
+          filesystem.
+        - Neither `file_path` nor `file` were specified.
     """
-    mime_type = None
-    exactly_one(filename=filename, file=file)
-
-    # first check (content_type)
-    if content_type:
-        filetype = STR_TO_FILETYPE.get(content_type)
-        if filetype:
-            return filetype
-
-    # second check (filename/file_name/file)
-    # continue if successfully define mime_type
-    if filename or file_filename:
-        _filename = filename or file_filename or ""
-        _, extension = os.path.splitext(_filename)
-        extension = extension.lower()
-        if os.path.isfile(_filename) and LIBMAGIC_AVAILABLE:
-            mime_type = magic.from_file(
-                _resolve_symlink(filename or file_filename),
-                mime=True,
-            )  # type: ignore
-        elif os.path.isfile(_filename):
-            import filetype as ft
-
-            mime_type = ft.guess_mime(filename)
-        if mime_type is None:
-            return EXT_TO_FILETYPE.get(extension, FileType.UNK)
-
-    elif file is not None:
-        if hasattr(file, "name"):
-            _, extension = os.path.splitext(file.name)
-        else:
-            extension = ""
-        extension = extension.lower()
-        # NOTE(robinson) - the python-magic docs recommend reading at least the first 2048 bytes
-        # Increased to 4096 because otherwise .xlsx files get detected as a zip file
-        # ref: https://github.com/ahupp/python-magic#usage
-        if LIBMAGIC_AVAILABLE:
-            mime_type = magic.from_buffer(file.read(4096), mime=True)
-        else:
-            import filetype as ft
-
-            mime_type = ft.guess_mime(file.read(4096))
-        if mime_type is None:
-            logger.warning(
-                "libmagic is unavailable but assists in filetype detection on file-like objects. "
-                "Please consider installing libmagic for better results.",
-            )
-            return EXT_TO_FILETYPE.get(extension, FileType.UNK)
-
-    else:
-        raise ValueError("No filename, file, nor file_filename were specified.")
-
-    """Mime type special cases."""
-    # third check (mime_type)
-
-    # NOTE(Crag): older magic lib does not differentiate between xls and doc
-    if mime_type == "application/msword" and extension == ".xls":
-        return FileType.XLS
-
-    elif mime_type.endswith("xml"):
-        if extension == ".html" or extension == ".htm":
-            return FileType.HTML
-        else:
-            return FileType.XML
-
-    elif mime_type in TXT_MIME_TYPES or mime_type.startswith("text"):
-        if not encoding:
-            encoding = "utf-8"
-        formatted_encoding = format_encoding_str(encoding)
-
-        if extension in [
-            ".eml",
-            ".p7s",
-            ".md",
-            ".rtf",
-            ".html",
-            ".rst",
-            ".org",
-            ".csv",
-            ".tsv",
-            ".json",
-        ]:
-            return EXT_TO_FILETYPE.get(extension)
-
-        # NOTE(crag): for older versions of the OS libmagic package, such as is currently
-        # installed on the Unstructured docker image, .json files resolve to "text/plain"
-        # rather than "application/json". this corrects for that case.
-        if _is_text_file_a_json(
-            file=file,
-            filename=filename,
-            encoding=formatted_encoding,
-        ):
-            return FileType.JSON
-
-        if _is_text_file_a_csv(
-            file=file,
-            filename=filename,
-            encoding=formatted_encoding,
-        ):
-            return FileType.CSV
-
-        if file and _check_eml_from_buffer(file=file) is True:
-            return FileType.EML
-
-        if extension in PLAIN_TEXT_EXTENSIONS:
-            return EXT_TO_FILETYPE.get(extension, FileType.UNK)
-
-        # Safety catch
-        if mime_type in STR_TO_FILETYPE:
-            return STR_TO_FILETYPE[mime_type]
-
-        return FileType.TXT
-
-    elif mime_type == "application/octet-stream":
-        if extension == ".docx":
-            return FileType.DOCX
-        elif file:
-            return _detect_filetype_from_octet_stream(file=file)
-        else:
-            return EXT_TO_FILETYPE.get(extension, FileType.UNK)
-
-    elif mime_type == "application/zip":
-        filetype = FileType.UNK
-        if file:
-            filetype = _detect_filetype_from_octet_stream(file=file)
-        elif filename is not None:
-            with open(filename, "rb") as f:
-                filetype = _detect_filetype_from_octet_stream(file=f)
-
-        extension = extension if extension else ""
-        if filetype == FileType.UNK:
-            return FileType.ZIP
-        else:
-            return EXT_TO_FILETYPE.get(extension, filetype)
-
-    elif _is_code_mime_type(mime_type):
-        # NOTE(robinson) - we'll treat all code files as plain text for now.
-        # we can update this logic and add filetypes for specific languages
-        # later if needed.
-        return FileType.TXT
-
-    elif mime_type.endswith("empty"):
-        return FileType.EMPTY
-
-    # For everything else
-    elif mime_type in STR_TO_FILETYPE:
-        return STR_TO_FILETYPE[mime_type]
-
-    logger.warning(
-        f"The MIME type{f' of {filename!r}' if filename else ''} is {mime_type!r}. "
-        "This file type is not currently supported in unstructured.",
-    )
-    return EXT_TO_FILETYPE.get(extension, FileType.UNK)
-
-
-def _detect_filetype_from_octet_stream(file: IO[bytes]) -> FileType:
-    """Detects the filetype, given a file with an application/octet-stream MIME type."""
-    file.seek(0)
-    if zipfile.is_zipfile(file):
-        file.seek(0)
-        archive = zipfile.ZipFile(file)
-
-        archive_filenames = [f.filename for f in archive.filelist]
-        if all(f in archive_filenames for f in EXPECTED_DOCX_FILES):
-            return FileType.DOCX
-        elif all(f in archive_filenames for f in EXPECTED_XLSX_FILES):
-            return FileType.XLSX
-        elif all(f in archive_filenames for f in EXPECTED_PPTX_FILES):
-            return FileType.PPTX
-
-    if LIBMAGIC_AVAILABLE:
-        # Infer mime type using magic if octet-stream is not zip file
-        mime_type = magic.from_buffer(file.read(4096), mime=True)
-        return STR_TO_FILETYPE.get(mime_type, FileType.UNK)
-    logger.warning(
-        "Could not detect the filetype from application/octet-stream MIME type.",
-    )
-    return FileType.UNK
-
-
-def _read_file_start_for_type_check(
-    filename: Optional[str] = None,
-    file: Optional[IO[bytes]] = None,
-    encoding: Optional[str] = "utf-8",
-) -> str:
-    """Reads the start of the file and returns the text content."""
-    exactly_one(filename=filename, file=file)
-    if file is not None:
-        file.seek(0)
-        file_content = file.read(4096)
-        if isinstance(file_content, str):
-            file_text = file_content
-        else:
-            file_text = file_content.decode(errors="ignore")
-        file.seek(0)
-    if filename is not None:
-        try:
-            with open(filename, encoding=encoding) as f:
-                file_text = f.read(4096)
-        except UnicodeDecodeError:
-            formatted_encoding, _ = detect_file_encoding(filename=filename)
-            with open(filename, encoding=formatted_encoding) as f:
-                file_text = f.read(4096)
-    return file_text
-
-
-def _is_text_file_a_json(
-    filename: Optional[str] = None,
-    file: Optional[IO[bytes]] = None,
-    encoding: Optional[str] = "utf-8",
-):
-    """Detects if a file that has a text/plain MIME type is a JSON file."""
-    file_text = _read_file_start_for_type_check(
+    ctx = _FileTypeDetectionContext.new(
+        file_path=file_path,
         file=file,
-        filename=filename,
         encoding=encoding,
+        content_type=content_type,
+        metadata_file_path=metadata_file_path,
     )
     try:
-        output = json.loads(file_text)
-        # NOTE(robinson) - Per RFC 4627 which defines the application/json media type,
-        # a string is a valid JSON. For our purposes, however, we want to treat that
-        # as a text file even if it is serializable as json.
-        # References:
-        # https://stackoverflow.com/questions/7487869/is-this-simple-string-considered-valid-json
-        # https://www.ietf.org/rfc/rfc4627.txt
-        if isinstance(output, str):
-            return False
-        return True
-    except json.JSONDecodeError:
-        return False
+        return _FileTypeDetector.file_type(ctx)
+    finally:
+        # -- a spooled upload is inspected in place and is returned at read position 0 --
+        if isinstance(file, tempfile.SpooledTemporaryFile):
+            file.seek(0)
 
 
 def is_json_processable(
@@ -497,145 +121,988 @@ def is_json_processable(
     file_text: Optional[str] = None,
     encoding: Optional[str] = "utf-8",
 ) -> bool:
+    """Deprecated: True when a file prefix regex-matches a JSON array of objects.
+
+    This helper formerly gated whether `partition_json()` would accept a payload, back when only
+    an array of serialized element-dicts was partitionable. `partition_json()` now accepts
+    arbitrary valid JSON and file-type detection parses the whole value, so this check no longer
+    participates in partitioning or detection routing. It is frozen as-is and will be removed in
+    a future release.
+    """
+    warnings.warn(
+        "is_json_processable() is deprecated and no longer used for partitioning or file-type"
+        " detection routing; it will be removed in a future release. Pre-checking is no longer"
+        " needed: partition_json()/partition_ndjson() accept any valid payload and raise"
+        " ValueError for malformed input.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     exactly_one(filename=filename, file=file, file_text=file_text)
+
     if file_text is None:
-        file_text = _read_file_start_for_type_check(
-            file=file,
-            filename=filename,
-            encoding=encoding,
-        )
+        file_text = _FileTypeDetectionContext.new(
+            file_path=filename, file=file, encoding=encoding
+        ).text_head
+
     return re.match(LIST_OF_DICTS_PATTERN, file_text) is not None
 
 
-def _count_commas(text: str):
-    """Counts the number of commas in a line, excluding commas in quotes."""
-    pattern = r"(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$),"
-    matches = re.findall(pattern, text)
-    return len(matches)
-
-
-def _is_text_file_a_csv(
+def is_ndjson_processable(
     filename: Optional[str] = None,
     file: Optional[IO[bytes]] = None,
+    file_text: Optional[str] = None,
     encoding: Optional[str] = "utf-8",
-):
-    """Detects if a file that has a text/plain MIME type is a CSV file."""
-    file_text = _read_file_start_for_type_check(
-        file=file,
-        filename=filename,
-        encoding=encoding,
+    allow_truncated_single_line: bool = False,
+) -> bool:
+    """Deprecated: True when a file prefix looks like newline-delimited JSON objects.
+
+    This helper formerly gated whether `partition_ndjson()` would accept a payload, back when
+    only lines of serialized element-dicts were partitionable. `partition_ndjson()` now accepts
+    arbitrary valid NDJSON and JSON/NDJSON detection parses the whole value in
+    `detect_filetype()`, so this check no longer participates in partitioning or detection
+    routing. It is frozen as-is and will be removed in a future release.
+    """
+    warnings.warn(
+        "is_ndjson_processable() is deprecated and no longer used for partitioning or file-type"
+        " detection routing; it will be removed in a future release. Pre-checking is no longer"
+        " needed: partition_json()/partition_ndjson() accept any valid payload and raise"
+        " ValueError for malformed input.",
+        DeprecationWarning,
+        stacklevel=2,
     )
-    lines = file_text.strip().splitlines()
-    if len(lines) < 2:
+    exactly_one(filename=filename, file=file, file_text=file_text)
+
+    allow_truncated = allow_truncated_single_line
+    if file_text is None:
+        file_text, allow_truncated = _FileTypeDetectionContext.new(
+            file_path=filename, file=file, encoding=encoding
+        ).json_disambiguation_text
+
+    text = file_text.lstrip()
+    if not text or not text.startswith("{"):
         return False
-    lines = lines[: len(lines)] if len(lines) < 10 else lines[:10]
-    header_count = _count_commas(lines[0])
-    if any("," not in line for line in lines):
+
+    newline_idx = text.find("\n")
+
+    if newline_idx == -1:
+        # Single-line input. A complete `{...}` parses as a dict and is treated as 1-record
+        # NDJSON (existing tests and `partition_ndjson` rely on this). When the caller knows this
+        # is a truncated first line from a JSON-like payload, a parse failure is still compatible
+        # with a long 1-record NDJSON payload.
+        try:
+            return isinstance(json.loads(text), dict)
+        except json.JSONDecodeError:
+            return allow_truncated
+
+    # Multi-line input. NDJSON requires each record to be on its own line, so the first line
+    # must independently parse as a JSON object. A pretty-printed single JSON object has its
+    # first line be just `{` (or similar fragment) which won't parse alone -- that's how we
+    # distinguish it from real NDJSON.
+    first_line = text[:newline_idx].rstrip()
+    if not first_line:
         return False
-    return all(_count_commas(line) == header_count for line in lines[1:])
+    try:
+        return isinstance(json.loads(first_line), dict)
+    except json.JSONDecodeError:
+        return False
 
 
-def _check_eml_from_buffer(file: IO[bytes]) -> bool:
-    """Checks if a text/plain file is actually a .eml file. Uses a regex pattern to see if the
-    start of the file matches the typical pattern for a .eml file."""
-    file.seek(0)
-    file_content = file.read(4096)
-    if isinstance(file_content, bytes):
-        file_head = file_content.decode("utf-8", errors="ignore")
-    else:
-        file_head = file_content
-    return EMAIL_HEAD_RE.match(file_head) is not None
+class _FileTypeDetector:
+    """Determines file type from a variety of possible inputs."""
+
+    def __init__(self, ctx: _FileTypeDetectionContext):
+        self._ctx = ctx
+
+    @classmethod
+    def file_type(cls, ctx: _FileTypeDetectionContext) -> FileType:
+        """Detect file-type of document-source described by `ctx`."""
+        return cls(ctx)._file_type
+
+    @property
+    def _file_type(self) -> FileType:
+        """FileType member corresponding to this document source."""
+        # -- An explicit content-type most commonly asserted by the client/SDK and is therefore
+        # -- inherently unreliable. On the other hand, binary file-types can be detected with 100%
+        # -- accuracy. So start with binary types and only then consider an asserted content-type,
+        # -- generally as a last resort.
+
+        if (
+            (  # strategy 1: most binary types can be detected with 100% accuracy
+                predicted_file_type := self._known_binary_file_type
+            )
+            or (  # strategy 2: use content-type asserted by caller
+                predicted_file_type := self._file_type_from_content_type
+            )
+            or (  # strategy 3: guess MIME-type using libmagic and use that
+                predicted_file_type := self._file_type_from_guessed_mime_type
+            )
+            or (  # strategy 4: use filename-extension, like ".docx" -> FileType.DOCX
+                predicted_file_type := self._file_type_from_file_extension
+            )
+        ):
+            result_file_type = predicted_file_type
+        else:
+            # give up and report FileType.UNK
+            result_file_type = FileType.UNK
+
+        if result_file_type == FileType.JSON:
+            # edge case where JSON/NDJSON content without file extension
+            # (magic lib can't distinguish them)
+            result_file_type = self._disambiguate_json_file_type
+
+        return result_file_type
+
+    @property
+    def _known_binary_file_type(self) -> FileType | None:
+        """Detect file-type for binary types we can positively detect."""
+        if file_type := _OleFileDetector.file_type(self._ctx):
+            return file_type
+
+        self._ctx.rule_out_cfb_content_types()
+
+        if file_type := _ZipFileDetector.file_type(self._ctx):
+            return file_type
+
+        self._ctx.rule_out_zip_content_types()
+
+        return None
+
+    @property
+    def _file_type_from_content_type(self) -> FileType | None:
+        """Map passed content-type argument to a file-type, subject to certain rules."""
+
+        # -- when no content-type was asserted by caller, this strategy is not applicable --
+        if not self._ctx.content_type:
+            return None
+
+        # -- otherwise we trust the passed `content_type` as long as `FileType` recognizes it --
+        file_type = FileType.from_mime_type(self._ctx.content_type)
+
+        # -- except "application/octet-stream", which maps to `FileType.UNK`. Servers commonly send
+        # -- it for any binary download, so it says nothing about the file-type --
+        return None if file_type is FileType.UNK else file_type
+
+    @property
+    def _disambiguate_json_file_type(self) -> FileType:
+        """Disambiguate JSON/NDJSON file-type based on file contents.
+
+        Reads at most `_JSON_DISAMBIGUATION_MAX_CHARS` (+1, plus one probe past that to
+        distinguish an exact-size payload from a truncated one) and restores a caller-owned
+        file-like object to read position 0. A ".ndjson" source extension wins over a
+        whole-payload JSON parse: a one-record ".ndjson" is also valid one-value JSON, but the
+        extension says it is NDJSON, so it classifies as `FileType.NDJSON` whenever the content is
+        NDJSON-shaped (each non-blank line a valid JSON value). (An asserted "application/x-ndjson"
+        content-type is already resolved to `FileType.NDJSON` upstream and never reaches here.)
+        Absent that signal, a payload that
+        parses in full as a single JSON value is `FileType.JSON`, even when it occupies a single
+        line (a one-line object is also valid one-record NDJSON, but JSON is the more useful
+        classification; note a one-line serialized-element object previously rehydrated via the
+        NDJSON route and now partitions as arbitrary JSON, since rehydration applies only to
+        arrays). Otherwise, two or more newline-delimited JSON values indicate `FileType.NDJSON`.
+        When the payload exceeds the read bound, one or more complete lines within the bound that
+        each parse as a JSON value indicate `FileType.NDJSON`; the residual degradation is an
+        NDJSON file whose first record has no newline inside the bound, which classifies as JSON
+        (and `partition_json()` will then raise "Not a valid json"). Anything else that libmagic
+        flagged as JSON falls back to `FileType.JSON`. Parsing uses `loads_strict_json()`, the
+        same strict parser the partitioners use, so a payload the partitioner would reject (e.g.
+        `NaN`) is never classified as parseable JSON/NDJSON.
+        """
+        with self._ctx.open() as file:
+            head = file.read(_JSON_DISAMBIGUATION_MAX_CHARS + 1)
+            # -- an exact-MAX+1 payload is fully in hand; only a further successful read means
+            # -- the payload was actually truncated --
+            truncated = len(head) > _JSON_DISAMBIGUATION_MAX_CHARS and bool(file.read(1))
+            # -- leave a caller-owned file-like object positioned for a follow-up read, e.g.
+            # -- detect-then-partition --
+            file.seek(0)
+
+        file_text = (
+            head
+            if isinstance(head, str)
+            else head.decode(encoding=self._ctx.encoding, errors="ignore")
+        )
+
+        # -- an explicit NDJSON signal wins over a whole-payload JSON parse, but only when the
+        # -- content is actually NDJSON-shaped. A truncated read has a partial trailing line that
+        # -- will not parse, so this check fails and the truncated branch below handles it --
+        if self._signals_ndjson and self._is_ndjson_shaped(file_text):
+            return FileType.NDJSON
+
+        if truncated:
+            # -- a whole-payload parse is impossible on a truncated read; drop the trailing
+            # -- partial line and classify on the complete lines within the bound. One or more
+            # -- complete lines that all parse as JSON values indicate NDJSON (a truncated
+            # -- pretty-printed JSON still classifies JSON -- its first line `{` or `[` does not
+            # -- parse) --
+            file_text = file_text.rpartition("\n")[0]
+            lines = [line for line in file_text.splitlines() if line.strip()]
+            if lines and self._all_lines_are_json_values(lines):
+                return FileType.NDJSON
+            return FileType.JSON
+
+        # -- a payload that parses whole as one JSON value is JSON, not NDJSON --
+        try:
+            loads_strict_json(file_text)
+            return FileType.JSON
+        except (json.JSONDecodeError, RecursionError):
+            pass
+
+        # -- two or more newline-delimited JSON values indicate NDJSON --
+        lines = [line for line in file_text.splitlines() if line.strip()]
+        if len(lines) >= 2 and self._all_lines_are_json_values(lines):
+            return FileType.NDJSON
+
+        return FileType.JSON
+
+    @property
+    def _signals_ndjson(self) -> bool:
+        """True when a ".ndjson" source extension deliberately signals NDJSON.
+
+        This extension tie-break outranks a whole-payload JSON parse in disambiguation. An
+        asserted "application/x-ndjson" content-type needs no handling here: it is mapped to
+        `FileType.NDJSON` by the content-type strategy before disambiguation (which runs only
+        for a `FileType.JSON` result) is ever reached.
+        """
+        return self._ctx.extension == ".ndjson"
+
+    def _is_ndjson_shaped(self, file_text: str) -> bool:
+        """True when `file_text` is at least one non-blank line, each a valid JSON value."""
+        lines = [line for line in file_text.splitlines() if line.strip()]
+        return bool(lines) and self._all_lines_are_json_values(lines)
+
+    @staticmethod
+    def _all_lines_are_json_values(lines: list[str]) -> bool:
+        """True when every line strictly parses as a JSON value."""
+        try:
+            for line in lines:
+                loads_strict_json(line)
+            return True
+        except (json.JSONDecodeError, RecursionError):
+            return False
+
+    @property
+    def _file_type_from_guessed_mime_type(self) -> FileType | None:
+        """FileType based on auto-detection of MIME-type by libmagic.
+
+        In some cases refinements are necessary on the magic-derived MIME-types. This process
+        includes applying those rules, most of which are accumulated through practical experience.
+        """
+        mime_type = self._ctx.mime_type
+        extension = self._ctx.extension
+
+        # -- when libmagic is not installed, the `filetype` package is used instead.
+        # -- `filetype.guess()` returns `None` for file-types it does not support, which
+        # -- unfortunately includes all the textual file-types like CSV, EML, HTML, MD, RST, RTF,
+        # -- TSV, and TXT. When we have no guessed MIME-type, this strategy is not applicable.
+        if mime_type is None:
+            return None
+
+        if mime_type.endswith("xml"):
+            return FileType.HTML if extension in (".html", ".htm") else FileType.XML
+
+        if differentiator := _TextFileDifferentiator.applies(self._ctx):
+            return differentiator.file_type
+
+        # -- All source-code files (e.g. *.py, *.js) are classified as plain text for the moment --
+        if self._ctx.has_code_mime_type:
+            return FileType.TXT
+
+        if mime_type.endswith("empty"):
+            return FileType.EMPTY
+
+        if mime_type.endswith("json") and self._ctx.extension == ".ndjson":
+            return FileType.NDJSON
+
+        # -- if no more-specific rules apply, use the MIME-type -> FileType mapping when present --
+        file_type = FileType.from_mime_type(mime_type)
+        if file_type != FileType.UNK:
+            return file_type
+
+        # -- on some environments libmagic can return a generic/unhelpful MIME-type
+        # -- like octet-stream") for files that the `filetype` package identify.
+        # -- when that happens we retry using `filetype`  `FileType.UNK` results.
+        if LIBMAGIC_AVAILABLE:
+            fallback_mime_type = (
+                ft.guess_mime(self._ctx.file_path)
+                if self._ctx.file_path
+                else ft.guess_mime(self._ctx.file_head)
+            )
+            fallback_file_type = FileType.from_mime_type(fallback_mime_type)
+            if fallback_file_type and fallback_file_type != FileType.UNK:
+                return fallback_file_type
+
+        return None
+
+    @cached_property
+    def _file_type_from_file_extension(self) -> FileType | None:
+        """Determine file-type from filename extension.
+
+        Returns `None` when no filename is available or when the extension does not map to a
+        supported file-type.
+        """
+        return FileType.from_extension(self._ctx.extension)
 
 
-PROGRAMMING_LANGUAGES = [
-    "javascript",
-    "python",
-    "java",
-    "c++",
-    "cpp",
-    "csharp",
-    "c#",
-    "php",
-    "ruby",
-    "swift",
-    "typescript",
-]
+class _FileTypeDetectionContext:
+    """Provides all arguments to auto-file detection and values derived from them.
+
+    NOTE that `._content_type` is mutable via `.rule_out_*_content_types()` methods, so it should
+    not be assumed to be a constant value across those calls.
+
+    This keeps computation of derived values out of the file-detection code but more importantly
+    allows the main filetype-detector to pass the full context to any delegates without coupling
+    itself to which values it might need.
+    """
+
+    def __init__(
+        self,
+        file_path: str | None = None,
+        *,
+        file: IO[bytes] | None = None,
+        encoding: str | None = None,
+        content_type: str | None = None,
+        metadata_file_path: str | None = None,
+    ):
+        self._file_path_arg = file_path
+        self._file_arg = file
+        self._encoding_arg = encoding
+        self._content_type = content_type
+        self._metadata_file_path = metadata_file_path
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        file_path: str | None,
+        file: IO[bytes] | None,
+        encoding: str | None,
+        content_type: str | None = None,
+        metadata_file_path: str | None = None,
+    ) -> _FileTypeDetectionContext:
+        self = cls(
+            file_path=file_path,
+            file=file,
+            encoding=encoding,
+            content_type=content_type,
+            metadata_file_path=metadata_file_path,
+        )
+        self._validate()
+        return self
+
+    @property
+    def content_type(self) -> str | None:
+        """MIME-type asserted by caller; not based on inspection of file by this process.
+
+        Would commonly occur when the file was downloaded via HTTP and a `"Content-Type:` header was
+        present on the response. These are often ambiguous and sometimes just wrong so get some
+        further verification. All lower-case when not `None`.
+        """
+        # -- Note `._content_type` is mutable via `.invalidate_content_type()` so this cannot be a
+        # -- `@cached_property`.
+        return self._content_type.lower() if self._content_type else None
+
+    @cached_property
+    def encoding(self) -> str:
+        """Character-set used to encode text of this file.
+
+        Relevant for textual file-types only, like HTML, TXT, JSON, etc.
+        """
+        return format_encoding_str(self._encoding_arg or "utf-8")
+
+    @cached_property
+    def extension(self) -> str:
+        """Best filename-extension we can muster, "" when there is no available source."""
+        # -- get from file_path, or file when it has a name (path) --
+        with self.open() as file:
+            # -- a temporary file can have an integer file-descriptor as its name, which carries
+            # -- no extension, and a spool is named by its temporary file, never by the document.
+            if (
+                not isinstance(file, tempfile.SpooledTemporaryFile)
+                and isinstance(name := getattr(file, "name", None), (str, os.PathLike))
+                and name
+                and (extension := os.path.splitext(name)[1].lower())
+            ):
+                return extension
+
+        # -- otherwise use metadata file-path when provided --
+        if file_path := self._metadata_file_path:
+            return os.path.splitext(file_path)[1].lower()
+
+        # -- otherwise empty str means no extension, same as a path like "a/b/name-no-ext" --
+        return ""
+
+    @cached_property
+    def file_head(self) -> bytes:
+        """The initial bytes of the file to be recognized, for use with libmagic detection."""
+        with self.open() as file:
+            return file.read(8192)
+
+    @cached_property
+    def file_path(self) -> str | None:
+        """Filesystem path to file to be inspected, when provided on call.
+
+        None when the caller specified the source as a file-like object instead. Useful for user
+        feedback on an error, but users of context should have little use for it otherwise.
+        """
+        if (file_path := self._file_path_arg) is None:
+            return None
+
+        return os.path.realpath(file_path) if os.path.islink(file_path) else file_path
+
+    @cached_property
+    def has_code_mime_type(self) -> bool:
+        """True when `mime_type` plausibly indicates a programming language source-code file."""
+        mime_type = self.mime_type
+
+        if mime_type is None:
+            return False
+
+        # -- check Go separately to avoid matching other MIME type containing "go" --
+        if mime_type == "text/x-go":
+            return True
+
+        return any(
+            lang in mime_type
+            for lang in [
+                "c#",
+                "c++",
+                "cpp",
+                "csharp",
+                "java",
+                "javascript",
+                "php",
+                "python",
+                "ruby",
+                "swift",
+                "typescript",
+            ]
+        )
+
+    @cached_property
+    def is_zipfile(self) -> bool:
+        """True when file is a Zip archive."""
+        with self.open() as file:
+            return zipfile.is_zipfile(file)
+
+    @cached_property
+    def mime_type(self) -> str | None:
+        """The best MIME-type we can get from `magic` (or `filetype` package).
+
+        A `str` return value is always in lower-case.
+        """
+        file_path = self.file_path
+
+        if LIBMAGIC_AVAILABLE:
+            import magic
+
+            magic_mime = (
+                magic.from_file(file_path, mime=True)
+                if file_path
+                else magic.from_buffer(self.file_head, mime=True)
+            )
+            magic_mime = magic_mime.lower() if magic_mime else None
+
+            # When libmagic returns None or "application/octet-stream", try the filetype package
+            # (magic-byte signatures) for formats libmagic often mis-detects (e.g. BMP, HEIC, WAV).
+            if magic_mime and magic_mime != "application/octet-stream":
+                return magic_mime
+
+            ft_mime = ft.guess_mime(file_path) if file_path else ft.guess_mime(self.file_head)
+            if ft_mime:
+                return ft_mime.lower()
+            # filetype could not identify; same outcome as if we had not tried it.
+            return magic_mime
+
+        mime_type = ft.guess_mime(file_path) if file_path else ft.guess_mime(self.file_head)
+
+        if mime_type is None:
+            logger.warning(
+                "libmagic is unavailable but assists in filetype detection. Please consider"
+                " installing libmagic for better results."
+            )
+            return None
+
+        return mime_type.lower()
+
+    @contextlib.contextmanager
+    def open(self) -> Iterator[IO[bytes]]:
+        """Encapsulates complexity of dealing with file-path or file-like-object.
+
+        Provides an `IO[bytes]` object as the "common-denominator" document source.
+
+        Must be used as a context manager using a `with` statement:
+
+            with self._file as file:
+                do things with file
+
+        File is guaranteed to be at read position 0 when called.
+        """
+        if self.file_path:
+            with open(self.file_path, "rb") as f:
+                yield f
+        else:
+            file = self._file_arg
+            assert file is not None  # -- guaranteed by `._validate()` --
+            file.seek(0)
+            yield file
+
+    def rule_out_cfb_content_types(self) -> None:
+        """Invalidate content-type when a legacy MS-Office file-type is asserted.
+
+        Used before returning `None`; at that point we know the file is not one of these formats
+        so if the asserted `content-type` is a legacy MS-Office type we know it's wrong and should
+        not be used as a fallback later in the detection process.
+        """
+        if FileType.from_mime_type(self._content_type) in (
+            FileType.DOC,
+            FileType.MSG,
+            FileType.PPT,
+            FileType.XLS,
+        ):
+            self._content_type = None
+
+    def rule_out_zip_content_types(self) -> None:
+        """Invalidate content-type when an MS-Office 2007+ file-type is asserted.
+
+        Used before returning `None`; at that point we know the file is not one of these formats
+        so if the asserted `content-type` is an MS-Office 2007+ type we know it's wrong and should
+        not be used as a fallback later in the detection process.
+        """
+        if FileType.from_mime_type(self._content_type) in (
+            FileType.DOCX,
+            FileType.EPUB,
+            FileType.ODT,
+            FileType.PPTX,
+            FileType.XLSX,
+            FileType.ZIP,
+        ):
+            self._content_type = None
+
+    @cached_property
+    def text_head(self) -> str:
+        """The initial characters of the text file for use with text-format differentiation.
+
+        Uses fallback character-set detection when the declared encoding cannot
+        decode the content, for both file paths and file-like objects.
+
+        Raises:
+            UnprocessableEntityError when the file cannot be decoded with the declared
+            encoding or any of the common fallback encodings.
+        """
+
+        if file := self._file_arg:
+            file.seek(0)
+            content = file.read(4096)
+            if not isinstance(content, str):
+                eof_reached = len(file.read(1)) == 0
+            file.seek(0)
+            if isinstance(content, str):
+                return content
+            try:
+                return content.decode(encoding=self.encoding)
+            except (UnicodeDecodeError, UnicodeError):
+                # A multi-byte character split at the 4096-byte read boundary
+                # raises UnicodeDecodeError even though the content is validly
+                # encoded. Decode incrementally with final=eof_reached so an
+                # incomplete trailing sequence is buffered when more content
+                # follows, while a genuinely truncated stream still falls
+                # through to character-set detection.
+                decoder = codecs.getincrementaldecoder(self.encoding)()
+                try:
+                    return decoder.decode(content, final=eof_reached)
+                except (UnicodeDecodeError, UnicodeError):
+                    # Use the same fallback character-set detection as the
+                    # file-path branch. Decoding with errors="ignore" silently
+                    # stripped undecodable characters and corrupted the text
+                    # head for non-UTF-8 streams (S3/GCS objects, API uploads)
+                    # — issue #4434. `final=eof_reached` for the same reason as above,
+                    # e.g. a UTF-16 surrogate pair split at the boundary.
+                    _, file_text = detect_file_encoding(file=content, final=eof_reached)
+                    return file_text[:4096]
+
+        file_path = self.file_path
+        assert file_path is not None  # -- guaranteed by `._validate` --
+
+        try:
+            with open(file_path, encoding=self.encoding) as f:
+                return f.read(4096)
+        except UnicodeDecodeError:
+            encoding, _ = detect_file_encoding(filename=file_path)
+            with open(file_path, encoding=encoding) as f:
+                return f.read(4096)
+
+    @cached_property
+    def json_disambiguation_text(self) -> tuple[str, bool]:
+        """Supports only the deprecated `is_ndjson_processable()`; remove together with it.
+
+        Live JSON/NDJSON disambiguation reads via `_disambiguate_json_file_type`.
+
+        Text prefix for JSON/NDJSON disambiguation and whether the first line was truncated.
+        """
+
+        if file := self._file_arg:
+            file.seek(0)
+            content, first_line_truncated = self._read_until_newline_or_limit(file)
+            file.seek(0)
+            if isinstance(content, str):
+                return content, first_line_truncated
+            return content.decode(encoding=self.encoding, errors="ignore"), first_line_truncated
+
+        file_path = self.file_path
+        assert file_path is not None  # -- guaranteed by `._validate` --
+
+        try:
+            with open(file_path, encoding=self.encoding) as f:
+                content, first_line_truncated = self._read_until_newline_or_limit(f)
+                assert isinstance(content, str)
+                return content, first_line_truncated
+        except UnicodeDecodeError:
+            encoding, _ = detect_file_encoding(filename=file_path)
+            with open(file_path, encoding=encoding) as f:
+                content, first_line_truncated = self._read_until_newline_or_limit(f)
+                assert isinstance(content, str)
+                return content, first_line_truncated
+
+    def _validate(self) -> None:
+        """Raise if the context is invalid."""
+        if self.file_path and not os.path.isfile(self.file_path):
+            raise FileNotFoundError(f"no such file {self._file_path_arg}")
+        if not self.file_path and not self._file_arg:
+            raise ValueError("either `file_path` or `file` argument must be provided")
+
+    @staticmethod
+    def _read_until_newline_or_limit(file: IO) -> tuple[str | bytes, bool]:
+        """Supports only the deprecated `is_ndjson_processable()`; remove together with it.
+
+        Live JSON/NDJSON disambiguation reads via `_disambiguate_json_file_type`.
+
+        Read through the first newline, stopping at a bounded prefix if none is found.
+        """
+        chunks: list[str | bytes] = []
+        chars_read = 0
+
+        while chars_read < _JSON_DISAMBIGUATION_MAX_CHARS:
+            chars_to_read = min(
+                _JSON_DISAMBIGUATION_CHUNK_SIZE,
+                _JSON_DISAMBIGUATION_MAX_CHARS - chars_read,
+            )
+            chunk = file.read(chars_to_read)
+            if not chunk:
+                return _FileTypeDetectionContext._join_text_chunks(chunks), False
+
+            newline = b"\n" if isinstance(chunk, bytes) else "\n"
+            newline_idx = chunk.find(newline)
+            if newline_idx != -1:
+                chunks.append(chunk[: newline_idx + 1])
+                return _FileTypeDetectionContext._join_text_chunks(chunks), False
+
+            chunks.append(chunk)
+            chars_read += len(chunk)
+
+        return _FileTypeDetectionContext._join_text_chunks(chunks), True
+
+    @staticmethod
+    def _join_text_chunks(chunks: list[str | bytes]) -> str | bytes:
+        """Supports only the deprecated `is_ndjson_processable()`; remove together with it.
+
+        Live JSON/NDJSON disambiguation reads via `_disambiguate_json_file_type`.
+
+        Join chunks without mixing text and bytes types.
+        """
+        if chunks and isinstance(chunks[0], bytes):
+            return b"".join(cast(list[bytes], chunks))
+        return "".join(cast(list[str], chunks))
 
 
-def _is_code_mime_type(mime_type: str) -> bool:
-    """Checks to see if the MIME type is a MIME type that would be used for a code
-    file."""
-    mime_type = mime_type.lower()
-    # NOTE(robinson) - check this one explicitly to avoid conflicts with other
-    # MIME types that contain "go"
-    if mime_type == "text/x-go":
-        return True
-    return any(language in mime_type for language in PROGRAMMING_LANGUAGES)
+class _OleFileDetector:
+    """Detect and differentiate a CFB file, aka. "OLE" file.
+
+    Compound File Binary Format (CFB), aka. OLE file, is use by Microsoft for legacy MS Office
+    files (DOC, PPT, XLS) as well as for Outlook MSG files.
+    """
+
+    def __init__(self, ctx: _FileTypeDetectionContext):
+        self._ctx = ctx
+
+    @classmethod
+    def file_type(cls, ctx: _FileTypeDetectionContext) -> FileType | None:
+        """Specific file-type when file is a CFB file, `None` otherwise."""
+        return cls(ctx)._file_type
+
+    @property
+    def _file_type(self) -> FileType | None:
+        """Differentiated file-type for Microsoft Compound File Binary Format (CFBF).
+
+        Returns one of:
+        - `FileType.DOC`
+        - `FileType.PPT`
+        - `FileType.XLS`
+        - `FileType.MSG`
+        - `None` when the file is not one of these.
+        """
+        # -- all CFB files share common magic number, start with that --
+        if not self._is_ole_file:
+            return None
+
+        # -- check storage contents of the ole file for file-type specific stream names --
+        if (ole_file_type := self._ole_file_type) is not None:
+            return ole_file_type
+
+        return None
+
+    @cached_property
+    def _is_ole_file(self) -> bool:
+        """True when file has CFB magic first 8 bytes."""
+        with self._ctx.open() as file:
+            return file.read(8) == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+    @cached_property
+    def _ole_file_type(self) -> FileType | None:
+        with self._ctx.open() as f:
+            ole = OleFileIO(f)  # pyright: ignore[reportUnknownVariableType]
+            root_storage = Storage.from_ole(ole)  # pyright: ignore[reportUnknownMemberType]
+
+        for stream in root_storage.streams:
+            if stream.name == "WordDocument":
+                return FileType.DOC
+            elif stream.name == "PowerPoint Document":
+                return FileType.PPT
+            elif stream.name == "Workbook":
+                return FileType.XLS
+            elif stream.name == "__properties_version1.0":
+                return FileType.MSG
+
+        return None
+
+
+class _TextFileDifferentiator:
+    """Refine a textual file-type that may not be as specific as it could be."""
+
+    def __init__(self, ctx: _FileTypeDetectionContext):
+        self._ctx = ctx
+
+    @classmethod
+    def applies(cls, ctx: _FileTypeDetectionContext) -> _TextFileDifferentiator | None:
+        """Constructs an instance, but only if this differentiator applies in `ctx`."""
+        mime_type = ctx.mime_type
+        return (
+            cls(ctx)
+            if mime_type and (mime_type == "message/rfc822" or mime_type.startswith("text"))
+            else None
+        )
+
+    @cached_property
+    def file_type(self) -> FileType:
+        """Differentiated file-type for textual content.
+
+        Always produces a file-type, worst case that's `FileType.TXT` when nothing more specific
+        applies.
+        """
+        extension = self._ctx.extension
+
+        if extension in [
+            ".csv",
+            ".eml",
+            ".html",
+            ".json",
+            ".markdown",
+            ".md",
+            ".ndjson",
+            ".org",
+            ".p7s",
+            ".rst",
+            ".rtf",
+            ".tab",
+            ".tsv",
+        ]:
+            # -- a ".json"/".ndjson" source is trusted by extension here (as the other textual
+            # -- formats are), so a valid scalar or scalar-per-line payload -- which the
+            # -- content-shape checks below would reject -- still routes to the JSON/NDJSON
+            # -- partitioner rather than being misclassified as TXT --
+            return FileType.from_extension(extension) or FileType.TXT
+
+        # NOTE(crag): for older versions of the OS libmagic package, such as is currently
+        # installed on the Unstructured docker image, .json files resolve to "text/plain"
+        # rather than "application/json". this corrects for that case.
+        if self._is_json:
+            return FileType.JSON
+
+        if self._is_csv:
+            return FileType.CSV
+
+        if self._is_eml:
+            return FileType.EML
+
+        if extension in (".text", ".txt"):
+            return FileType.TXT
+
+        # Safety catch
+        if file_type := FileType.from_mime_type(self._ctx.mime_type):
+            return file_type
+
+        return FileType.TXT
+
+    @cached_property
+    def _is_csv(self) -> bool:
+        """True when file is plausibly in Comma Separated Values (CSV) format."""
+
+        def count_commas(text: str):
+            """Counts the number of commas in a line, excluding commas in quotes."""
+            pattern = r"(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$),"
+            matches = re.findall(pattern, text)
+            return len(matches)
+
+        lines = self._ctx.text_head.strip().splitlines()
+        if len(lines) < 2:
+            return False
+        # -- check at most the first 10 lines --
+        lines = lines[: len(lines)] if len(lines) < 10 else lines[:10]
+        # -- any lines without at least one comma disqualifies the file --
+        if any("," not in line for line in lines):
+            return False
+        header_count = count_commas(lines[0])
+        return all(count_commas(line) == header_count for line in lines[1:])
+
+    @cached_property
+    def _is_eml(self) -> bool:
+        """Checks if a text/plain file is actually a .eml file.
+
+        Uses a regex pattern to see if the start of the file matches the typical pattern for a .eml
+        file.
+        """
+        return EMAIL_HEAD_RE.match(self._ctx.text_head) is not None
+
+    @cached_property
+    def _is_json(self) -> bool:
+        """True when file is JSON collection.
+
+        A JSON file that contains only a string, number, or boolean, while valid JSON, will fail
+        this test since it is not partitionable.
+        """
+        text_head = self._ctx.text_head
+
+        # -- an empty file is not JSON --
+        if not text_head.lstrip():
+            return False
+
+        # -- has to be a list or object, no string, number, or bool --
+        if text_head.lstrip()[0] not in "[{":
+            return False
+
+        try:
+            with self._ctx.open() as file:
+                json.load(file)
+            return True
+        except json.JSONDecodeError:
+            return False
+
+
+class _ZipFileDetector:
+    """Detect and differentiate a Zip-archive file."""
+
+    def __init__(self, ctx: _FileTypeDetectionContext):
+        self._ctx = ctx
+
+    @classmethod
+    def file_type(cls, ctx: _FileTypeDetectionContext) -> FileType | None:
+        """Most specific file-type available when file is a Zip file, `None` otherwise.
+
+        MS-Office 2007+ files are detected with 100% accuracy. Otherwise this returns `None`, even
+        when we can tell it's a Zip file, so later strategies can have a crack at it. In
+        particular, ODT and EPUB files are Zip archives but are not detected here.
+        """
+        return cls(ctx)._file_type
+
+    @cached_property
+    def _file_type(self) -> FileType | None:
+        """Differentiated file-type for a Zip archive.
+
+        Returns `FileType.DOCX`, `FileType.PPTX`, or `FileType.XLSX` when one of those applies,
+        `None` otherwise.
+        """
+        if not self._ctx.is_zipfile:
+            return None
+
+        with self._ctx.open() as file:
+            zip = zipfile.ZipFile(file)
+
+            filenames = zip.namelist()
+
+            if any(re.match(r"word/document.*\.xml$", filename) for filename in filenames):
+                return FileType.DOCX
+
+            if any(re.match(r"xl/workbook.*\.xml$", filename) for filename in filenames):
+                return FileType.XLSX
+
+            if any(re.match(r"ppt/presentation.*\.xml$", filename) for filename in filenames):
+                return FileType.PPTX
+
+            # -- ODT and EPUB files place their MIME-type in `mimetype` in the archive root --
+            if "mimetype" in filenames:
+                with zip.open("mimetype") as f:
+                    mime_type = f.read().decode("utf-8").strip()
+                    return FileType.from_mime_type(mime_type)
+
+        return FileType.ZIP
 
 
 _P = ParamSpec("_P")
 
 
-def add_metadata(func: Callable[_P, List[Element]]) -> Callable[_P, List[Element]]:
+def add_metadata(func: Callable[_P, list[Element]]) -> Callable[_P, list[Element]]:
     @functools.wraps(func)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> List[Element]:
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> list[Element]:
         elements = func(*args, **kwargs)
         call_args = get_call_args_applying_defaults(func, *args, **kwargs)
-        include_metadata = call_args.get("include_metadata", True)
-        if include_metadata:
-            if call_args.get("metadata_filename"):
-                call_args["filename"] = call_args.get("metadata_filename")
 
-            metadata_kwargs = {
-                kwarg: call_args.get(kwarg) for kwarg in ("filename", "url", "text_as_html")
-            }
-            # NOTE (yao): do not use cast here as cast(None) still is None
-            if not str(kwargs.get("model_name", "")).startswith("chipper"):
-                # NOTE(alan): Skip hierarchy if using chipper, as it should take care of that
-                elements = set_element_hierarchy(elements)
+        if call_args.get("metadata_filename"):
+            call_args["filename"] = call_args.get("metadata_filename")
 
-            for element in elements:
-                # NOTE(robinson) - Attached files have already run through this logic
-                # in their own partitioning function
-                if element.metadata.attached_to_filename is None:
-                    add_element_metadata(element, **metadata_kwargs)
+        metadata_kwargs = {
+            kwarg: call_args.get(kwarg) for kwarg in ("filename", "url", "text_as_html")
+        }
+        # NOTE (yao): do not use cast here as cast(None) still is None
+        if not str(kwargs.get("model_name", "")).startswith("chipper"):
+            # NOTE(alan): Skip hierarchy if using chipper, as it should take care of that
+            elements = set_element_hierarchy(elements)
 
-            return elements
-        else:
-            return remove_element_metadata(elements)
+        for element in elements:
+            # NOTE(robinson) - Attached files have already run through this logic
+            # in their own partitioning function
+            if element.metadata.attached_to_filename is None:
+                add_element_metadata(element, **metadata_kwargs)
+
+        return elements
 
     return wrapper
 
 
 def add_filetype(
     filetype: FileType,
-) -> Callable[[Callable[_P, List[Element]]], Callable[_P, List[Element]]]:
+) -> Callable[[Callable[_P, list[Element]]], Callable[_P, list[Element]]]:
     """Post-process element-metadata for list[Element] from partitioning.
 
     This decorator adds a post-processing step to a document partitioner.
 
-    - Adds `metadata_filename` and `include_metadata` parameters to docstring if not present.
-    - Adds `.metadata.regex-metadata` when `regex_metadata` keyword-argument is provided.
-    - Updates element.id to a UUID when `unique_element_ids` argument is provided and True.
+    - Adds `.metadata.filetype` (source-document MIME-type) metadata value
 
+    This "partial" decorator is present because `partition_image()` does not apply
+    `.metadata.filetype` this way since each image type has its own MIME-type (e.g. `image.jpeg`,
+    `image/png`, etc.).
     """
 
-    def decorator(func: Callable[_P, List[Element]]) -> Callable[_P, List[Element]]:
+    def decorator(func: Callable[_P, list[Element]]) -> Callable[_P, list[Element]]:
         @functools.wraps(func)
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> List[Element]:
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> list[Element]:
             elements = func(*args, **kwargs)
-            params = get_call_args_applying_defaults(func, *args, **kwargs)
-            include_metadata = params.get("include_metadata", True)
-            if include_metadata:
-                for element in elements:
-                    # NOTE(robinson) - Attached files have already run through this logic
-                    # in their own partitioning function
-                    if element.metadata.attached_to_filename is None:
-                        add_element_metadata(element, filetype=FILETYPE_TO_MIMETYPE[filetype])
 
-                return elements
-            else:
-                return remove_element_metadata(elements)
+            for element in elements:
+                # NOTE(robinson) - Attached files have already run through this logic
+                # in their own partitioning function
+                if element.metadata.attached_to_filename is None:
+                    add_element_metadata(element, filetype=filetype.mime_type)
+
+            return elements
 
         return wrapper
 
@@ -644,10 +1111,10 @@ def add_filetype(
 
 def add_metadata_with_filetype(
     filetype: FileType,
-) -> Callable[[Callable[_P, List[Element]]], Callable[_P, List[Element]]]:
+) -> Callable[[Callable[_P, list[Element]]], Callable[_P, list[Element]]]:
     """..."""
 
-    def decorator(func: Callable[_P, List[Element]]) -> Callable[_P, List[Element]]:
+    def decorator(func: Callable[_P, list[Element]]) -> Callable[_P, list[Element]]:
         return add_filetype(filetype=filetype)(add_metadata(func))
 
     return decorator

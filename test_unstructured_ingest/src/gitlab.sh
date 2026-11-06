@@ -24,7 +24,7 @@ function cleanup() {
 }
 trap cleanup EXIT
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   gitlab \
   --num-processes "$max_processes" \
@@ -33,11 +33,12 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --strategy hi_res \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --git-branch 'v0.0.7' \
   --git-file-glob '*.md,*.txt' \
   --url https://gitlab.com/gitlab-com/content-sites/docsy-gitlab \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-num-files-output.sh 2 $OUTPUT_FOLDER_NAME

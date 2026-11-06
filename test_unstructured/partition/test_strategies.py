@@ -1,7 +1,6 @@
-import os
-
 import pytest
 
+from test_unstructured.unit_utils import example_doc_path
 from unstructured.documents.elements import Text
 from unstructured.partition import pdf, strategies
 from unstructured.partition.utils.constants import PartitionStrategy
@@ -43,7 +42,7 @@ def test_validate_strategy_raises_for_bad_strategy():
     ],
 )
 def test_is_pdf_text_extractable(filename, from_file, expected):
-    filename = os.path.join("example-docs", filename)
+    filename = example_doc_path(f"pdf/{filename}")
 
     if from_file:
         with open(filename, "rb") as f:
@@ -58,6 +57,12 @@ def test_is_pdf_text_extractable(filename, from_file, expected):
     )
 
     assert pdf_text_extractable is expected
+
+    if from_file:
+        with open(filename, "rb") as f:
+            assert pdf.pdf_has_extractable_text(file=f) is expected
+    else:
+        assert pdf.pdf_has_extractable_text(filename=filename) is expected
 
 
 @pytest.mark.parametrize(
@@ -129,3 +134,25 @@ def test_determine_image_auto_strategy():
         is_image=True,
     )
     assert strategy == PartitionStrategy.HI_RES
+
+
+@pytest.mark.parametrize(
+    ("strategy", "installed", "expected"),
+    [
+        (PartitionStrategy.AUTO, {"unstructured_inference", "unstructured_pytesseract"}, True),
+        (PartitionStrategy.FAST, {"unstructured_inference", "unstructured_pytesseract"}, True),
+        (PartitionStrategy.HI_RES, {"unstructured_inference", "unstructured_pytesseract"}, False),
+        (PartitionStrategy.HI_RES, {"unstructured_inference"}, False),
+        (PartitionStrategy.HI_RES, {"unstructured_pytesseract"}, False),
+        (PartitionStrategy.HI_RES, set(), True),
+        (PartitionStrategy.OCR_ONLY, {"unstructured_inference", "unstructured_pytesseract"}, False),
+        (PartitionStrategy.OCR_ONLY, {"unstructured_pytesseract"}, False),
+        (PartitionStrategy.OCR_ONLY, {"unstructured_inference"}, True),
+    ],
+)
+def test_pdf_strategy_can_resolve_to_fast(monkeypatch, strategy, installed, expected):
+    monkeypatch.setattr(strategies, "dependency_exists", lambda dep: dep in installed)
+
+    assert strategies.pdf_strategy_can_resolve_to_fast(strategy) is expected
+    resolved = strategies.determine_pdf_or_image_strategy(strategy, pdf_text_extractable=True)
+    assert (resolved == PartitionStrategy.FAST) is expected

@@ -2,7 +2,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from unstructured.documents.elements import Text
+from unstructured.documents.elements import Element
+from unstructured.logger import logger
 
 LABEL_STUDIO_TYPE = List[Dict[str, Dict[str, str]]]
 
@@ -110,7 +111,7 @@ class LabelStudioPrediction(LabelStudioAnnotation):
 
 
 def stage_for_label_studio(
-    elements: List[Text],
+    elements: List[Element],
     annotations: Optional[List[List[LabelStudioAnnotation]]] = None,
     predictions: Optional[List[List[LabelStudioPrediction]]] = None,
     text_field: str = "text",
@@ -118,6 +119,11 @@ def stage_for_label_studio(
 ) -> LABEL_STUDIO_TYPE:
     """Converts the document to the format required for upload to LabelStudio.
     ref: https://labelstud.io/guide/tasks.html#Example-JSON-format"""
+    # NOTE(alan): The background for this is that we test this function with the package
+    # label_studio_sdk, and we're stuck on a version with a high CVE unless we drop to version 1 of
+    # numpy. The least bad way forward was to deprecate the function, remove the test, and drop the
+    # dependency.
+    logger.warning("This function is deprecated, and is unlikely to be maintained in the future.")
     if annotations is not None and len(elements) != len(annotations):
         raise ValueError("The length of elements and annotations must match.")
     if predictions is not None and len(elements) != len(predictions):

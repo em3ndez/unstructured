@@ -27,7 +27,7 @@ trap cleanup EXIT
 TEST_FILE_NAME=layout-parser-paper-with-table.pdf
 
 # including pdf-infer-table-structure to validate partition arguments are passed to the api
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   local \
   --api-key "$UNS_API_KEY" \
@@ -37,11 +37,12 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --chunking-strategy by_page \
   --chunk-max-characters 10000 \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --num-processes "$max_processes" \
-  --input-path "example-docs/$TEST_FILE_NAME" \
-  --work-dir "$WORK_DIR"
+  --input-path "example-docs/pdf/$TEST_FILE_NAME" \
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 RESULT_FILE_PATH="$OUTPUT_DIR/$TEST_FILE_NAME.json"
 # validate that there is at least one table with text_as_html in the results

@@ -19,7 +19,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "ef1707e2cadf95400b688c2ea15f6657",
@@ -41,7 +41,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "23332b5a74f166672eda00916897d09c",
@@ -63,7 +63,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "00290c97c096654a5ad758c1aa963b8b",
@@ -85,7 +85,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "252751d6be961b05b423171e53612340",
@@ -107,7 +107,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "9d9ce8fac05e0a6064fc173f51f886b5",
@@ -129,7 +129,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "bcce1169cfd0d24990e5dcf9a1f4417c",
@@ -151,7 +151,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "bef3930174a53244d9333aba98d6ef37",
@@ -173,7 +173,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "40aa9fc4d7bc2522da02123e07615fd1",
@@ -195,7 +195,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "f284f9398e8b26287f59b01df3f87395",
@@ -217,7 +217,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "6da438b97512b144f96de65bcb35c380",
@@ -239,7 +239,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "a3d7fbfb7e7cb92f6c2c809be1aa6a67",
@@ -261,7 +261,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "6780aadfc4e2332b6da7302971e7744e",
@@ -283,7 +283,7 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
     "element_id": "ca6e8673360d0f9a946786edc086f26e",
@@ -305,10 +305,33 @@
       ]
     },
     "text": "testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3 testtext3",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "9b3f13651bd9c76260e5af72a9178c15",
+    "element_id": "f8085d2948c73dfb968f7b221f3e8fab",
+    "metadata": {
+      "data_source": {
+        "date_created": "2023-07-09T12:56:40.842000",
+        "date_modified": "2023-07-09T12:57:59.173000",
+        "record_locator": {
+          "page_id": "1605989",
+          "url": "https://unstructured-ingest-test.atlassian.net"
+        },
+        "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
+        "version": "1"
+      },
+      "filetype": "text/html",
+      "image_url": "https://unstructured-ingest-test.atlassian.net/wiki/download/thumbnails/1605989/image-20230709-015203.png?version=1&modificationDate=1688907429067&cacheVersion=1&api=v2&width=680&height=259",
+      "languages": [
+        "eng",
+        "fra"
+      ]
+    },
+    "text": "",
+    "type": "Image"
+  },
+  {
+    "element_id": "48d494bb12fd182b0106bff99dd2e3be",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -326,11 +349,55 @@
         "fra"
       ]
     },
-    "text": "Testdoc3 List Item 1Testdoc3 List Item 1 Nested Item ATestdoc3 List Item 1 Nested Item B",
-    "type": "ListItem"
+    "text": "Testdoc3 List Item 1",
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "1d29a4258d918a1ef755a28e6ef99ae0",
+    "element_id": "3f1b3ecb6515a47b94579cf7de892f09",
+    "metadata": {
+      "data_source": {
+        "date_created": "2023-07-09T12:56:40.842000",
+        "date_modified": "2023-07-09T12:57:59.173000",
+        "record_locator": {
+          "page_id": "1605989",
+          "url": "https://unstructured-ingest-test.atlassian.net"
+        },
+        "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
+        "version": "1"
+      },
+      "filetype": "text/html",
+      "languages": [
+        "eng",
+        "fra"
+      ]
+    },
+    "text": "Testdoc3 List Item 1 Nested Item A",
+    "type": "UncategorizedText"
+  },
+  {
+    "element_id": "171423f703a966d2616837ed489f6975",
+    "metadata": {
+      "data_source": {
+        "date_created": "2023-07-09T12:56:40.842000",
+        "date_modified": "2023-07-09T12:57:59.173000",
+        "record_locator": {
+          "page_id": "1605989",
+          "url": "https://unstructured-ingest-test.atlassian.net"
+        },
+        "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
+        "version": "1"
+      },
+      "filetype": "text/html",
+      "languages": [
+        "eng",
+        "fra"
+      ]
+    },
+    "text": "Testdoc3 List Item 1 Nested Item B",
+    "type": "UncategorizedText"
+  },
+  {
+    "element_id": "87daeeb71306ae76a90c0e6ccac0dd47",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -349,10 +416,10 @@
       ]
     },
     "text": "Testdoc3 List Item 2",
-    "type": "ListItem"
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "4244e1b92dbb75ce777baf4fb75a17fd",
+    "element_id": "c4d15cc61c5d6a3f2350f758b82e487f",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -371,10 +438,10 @@
       ]
     },
     "text": "Testdoc3 List Item 3",
-    "type": "ListItem"
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "5c9ab1d333c163c4e5974a1b6241f4db",
+    "element_id": "e069a6333ef83f6f250880a500439da3",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -393,10 +460,10 @@
       ]
     },
     "text": "Testdoc3 List Item 4",
-    "type": "ListItem"
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "446567ab87e1207a1e90f68a7357ea69",
+    "element_id": "2f030590e85c72dd4a2fc739cc05affe",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -415,10 +482,10 @@
       ]
     },
     "text": "Testdoc3 List Item 5",
-    "type": "ListItem"
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "fceace3d21355835e0efab1220200754",
+    "element_id": "2db738cf60bf0471df90b6141fc6a8e5",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -434,9 +501,6 @@
       "languages": [
         "eng",
         "fra"
-      ],
-      "link_start_indexes": [
-        0
       ],
       "link_texts": [
         "This is the link for unstructured . io."
@@ -449,7 +513,7 @@
     "type": "NarrativeText"
   },
   {
-    "element_id": "3103a93c0b7268907d5f12ec3919630f",
+    "element_id": "ab3005ca05b4f48396361646916154b4",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -461,12 +525,6 @@
         "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
         "version": "1"
       },
-      "emphasized_text_contents": [
-        "Testdoc3 Checklist Item 1"
-      ],
-      "emphasized_text_tags": [
-        "span"
-      ],
       "filetype": "text/html",
       "languages": [
         "eng",
@@ -477,7 +535,7 @@
     "type": "ListItem"
   },
   {
-    "element_id": "49e02888ddebdfccb7c5d813d1cd8d80",
+    "element_id": "ac70c0a823f0a1d56777036e77e77fd9",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -489,12 +547,6 @@
         "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
         "version": "1"
       },
-      "emphasized_text_contents": [
-        "Testdoc3 Checklist Item 2 (checked)"
-      ],
-      "emphasized_text_tags": [
-        "span"
-      ],
       "filetype": "text/html",
       "languages": [
         "eng",
@@ -505,7 +557,7 @@
     "type": "ListItem"
   },
   {
-    "element_id": "623205757930bf68f63245809ab88165",
+    "element_id": "099fca1cec6f3eaa5f71ed9c2ed235e4",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -517,12 +569,6 @@
         "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
         "version": "1"
       },
-      "emphasized_text_contents": [
-        "Testdoc3 Checklist Item 3"
-      ],
-      "emphasized_text_tags": [
-        "span"
-      ],
       "filetype": "text/html",
       "languages": [
         "eng",
@@ -533,7 +579,7 @@
     "type": "ListItem"
   },
   {
-    "element_id": "4878f87e35a0014ef3b7137a5eb3be37",
+    "element_id": "85d4a299ad3ee61201530bf0030808b1",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -555,7 +601,7 @@
     "type": "UncategorizedText"
   },
   {
-    "element_id": "f6d6c30b44ae2ef4a98631d6ab8daec3",
+    "element_id": "a1a4f27d3b3cc32777e25b3bb0766083",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -571,7 +617,7 @@
         "Testdoc3 bold text"
       ],
       "emphasized_text_tags": [
-        "strong"
+        "b"
       ],
       "filetype": "text/html",
       "languages": [
@@ -583,7 +629,7 @@
     "type": "NarrativeText"
   },
   {
-    "element_id": "181c7bd23470228c174857aaa63ee8f8",
+    "element_id": "976749a5d532d1f18195d61fe8c04be3",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -599,7 +645,7 @@
         "Testdoc3 italic text"
       ],
       "emphasized_text_tags": [
-        "em"
+        "i"
       ],
       "filetype": "text/html",
       "languages": [
@@ -608,10 +654,10 @@
       ]
     },
     "text": "Testdoc3 italic text",
-    "type": "Title"
+    "type": "UncategorizedText"
   },
   {
-    "element_id": "f8aba27556bcc7ec05baf554f302d7be",
+    "element_id": "079d83c4a7622c70baab0336e3128ec4",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -633,7 +679,7 @@
     "type": "Title"
   },
   {
-    "element_id": "7f33bffe06658936ae4a2db0c3475b09",
+    "element_id": "68e58e6fec19f4ec291fd5bcca3dadd8",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -655,7 +701,7 @@
     "type": "Title"
   },
   {
-    "element_id": "ac020a7fd396847465e98ade9f72a2be",
+    "element_id": "8dbaefc9dcf7af80f14871cdd2b0c1d6",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -677,7 +723,7 @@
     "type": "Title"
   },
   {
-    "element_id": "3c087dd347cfe41d03590ab09c2d5a0a",
+    "element_id": "2ca9400f81b794c7d595f9bcd719b18a",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -699,7 +745,7 @@
     "type": "Title"
   },
   {
-    "element_id": "32b6823ad80e7c1ba90f8a4285a1a080",
+    "element_id": "191672694e36e804e20214e8c9bd2d44",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -721,7 +767,7 @@
     "type": "Title"
   },
   {
-    "element_id": "2c23de0ced97cc9bcf524905170df223",
+    "element_id": "10d98c7ebc4b2cd6e5508aa9563cc788",
     "metadata": {
       "data_source": {
         "date_created": "2023-07-09T12:56:40.842000",
@@ -742,5 +788,28 @@
     },
     "text": "Testdoc3 Table: Column 1 Row 0 Testdoc3 Table: Column 2 Row 0 Testdoc3 Table: Column 3 Row 0 Testdoc3 Table: Column 1 Row 1 Testdoc3 Table: Column 2 Row 1 Testdoc3 Table: Column 3 Row 1 Testdoc3 Table: Column 1 Row 2 Testdoc3 Table: Column 2 Row 2 Testdoc3 Table: Column 3 Row 2",
     "type": "Table"
+  },
+  {
+    "element_id": "45b142b9287e8ebadbc1dfb48ee5245a",
+    "metadata": {
+      "data_source": {
+        "date_created": "2023-07-09T12:56:40.842000",
+        "date_modified": "2023-07-09T12:57:59.173000",
+        "record_locator": {
+          "page_id": "1605989",
+          "url": "https://unstructured-ingest-test.atlassian.net"
+        },
+        "url": "https://unstructured-ingest-test.atlassian.net/wiki/rest/api/content/1605989",
+        "version": "1"
+      },
+      "filetype": "text/html",
+      "image_url": "https://unstructured-ingest-test.atlassian.net/wiki/download/thumbnails/1605989/image-20230709-020021.png?version=1&modificationDate=1688907429074&cacheVersion=1&api=v2&width=475&height=236",
+      "languages": [
+        "eng",
+        "fra"
+      ]
+    },
+    "text": "",
+    "type": "Image"
   }
 ]

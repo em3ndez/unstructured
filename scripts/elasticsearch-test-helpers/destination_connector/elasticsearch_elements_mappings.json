@@ -12,7 +12,9 @@
       },
       "embeddings": {
          "type": "dense_vector",
-         "dims": 384
+         "dims": 384,
+         "index": "true",
+         "similarity": "cosine"
       },
       "metadata": {
          "type": "object",
@@ -132,9 +134,6 @@
             "text_as_html": {
                "type": "text",
                "analyzer": "standard"
-            },
-            "regex_metadata": {
-               "type": "object"
             },
             "detection_class_prob": {
                "type": "float"

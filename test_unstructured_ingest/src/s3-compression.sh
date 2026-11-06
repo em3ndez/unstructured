@@ -20,7 +20,7 @@ function cleanup() {
 }
 trap cleanup EXIT
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   s3 \
   --num-processes "$max_processes" \
@@ -29,12 +29,13 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --strategy fast \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --remote-url s3://utic-dev-tech-fixtures/small-pdf-set-w-compression/ \
   --anonymous \
   --work-dir "$WORK_DIR" \
-  --uncompress
+  --uncompress \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-num-files-output.sh 12 $OUTPUT_FOLDER_NAME
 

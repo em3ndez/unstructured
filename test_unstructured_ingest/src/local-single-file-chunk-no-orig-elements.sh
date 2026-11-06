@@ -6,6 +6,8 @@
 # option which otherwise has no other coverage.
 # ------------------------------------------------------------------------------------------------
 
+# shellcheck disable=SC2329  # Functions are invoked indirectly
+
 set -e
 
 # -- Test Parameters: These vary by test file, others are common computed values --
@@ -21,7 +23,7 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-$SCRIPT_DIR}
 OUTPUT_DIR=$OUTPUT_ROOT/structured-output/$OUTPUT_FOLDER_NAME
 WORK_DIR=$OUTPUT_ROOT/workdir/$OUTPUT_FOLDER_NAME
 # -- use absolute path of input file to verify passing an absolute path --
-ABS_INPUT_PATH="$SCRIPT_DIR/../example-docs/$EXAMPLE_DOC"
+ABS_INPUT_PATH="$SCRIPT_DIR/../example-docs/pdf/$EXAMPLE_DOC"
 max_processes=${MAX_PROCESSES:=$(python3 -c "import os; print(os.cpu_count())")}
 
 # shellcheck disable=SC1091
@@ -33,21 +35,21 @@ function cleanup() {
 }
 trap cleanup EXIT
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
-
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   local \
   --chunking-strategy by_title \
-  --chunk-no-include-orig-elements \
+  --no-chunk-include-orig-elements \
   --chunk-max-characters 2000 \
-  --chunk-no-multipage-sections \
+  --no-chunk-multipage-sections \
   --input-path "$ABS_INPUT_PATH" \
   --metadata-exclude coordinates,filename,file_directory,metadata.data_source.date_created,metadata.data_source.date_modified,metadata.data_source.date_processed,metadata.last_modified,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
   --num-processes "$max_processes" \
-  --output-dir "$OUTPUT_DIR" \
   --reprocess \
   --verbose \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 set +e
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

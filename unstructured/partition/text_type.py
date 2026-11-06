@@ -4,13 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-import sys
-from typing import List, Optional
-
-if sys.version_info < (3, 8):
-    from typing_extensions import Final  # pragma: nocover
-else:
-    from typing import Final
+from typing import Final, List, Optional
 
 from unstructured.cleaners.core import remove_punctuation
 from unstructured.logger import trace_logger
@@ -224,17 +218,23 @@ def sentence_count(text: str, min_length: Optional[int] = None) -> int:
     """
     sentences = sent_tokenize(text)
     count = 0
-    for sentence in sentences:
-        sentence = remove_punctuation(sentence)
-        words = [word for word in word_tokenize(sentence) if word != "."]
-        if min_length and len(words) < min_length:
-            trace_logger.detail(  # type: ignore
-                f"Sentence does not exceed {min_length} word tokens, it will not count toward "
-                "sentence count.\n"
-                f"{sentence}",
-            )
-            continue
-        count += 1
+    if min_length:
+        trace_detail = trace_logger.detail  # type: ignore
+        for sentence in sentences:
+            stripped = remove_punctuation(sentence)
+            # Fast token count after punctuation is removed: just split on whitespace
+            word_count = sum(1 for token in stripped.split() if token != ".")
+            if word_count < min_length:
+                trace_detail(
+                    f"Sentence does not exceed {min_length} word tokens, it will not count toward "
+                    "sentence count.\n"
+                    f"{stripped}",
+                )
+                continue
+            count += 1
+    else:
+        for sentence in sentences:
+            count += 1
     return count
 
 
@@ -251,11 +251,17 @@ def under_non_alpha_ratio(text: str, threshold: float = 0.5):
         If the proportion of non-alpha characters exceeds this threshold, the function
         returns False
     """
-    if len(text) == 0:
+    if not text:
         return False
 
-    alpha_count = len([char for char in text if char.strip() and char.isalpha()])
-    total_count = len([char for char in text if char.strip()])
+    alpha_count = 0
+    total_count = 0
+    for char in text:
+        if not char.isspace():
+            total_count += 1
+            if char.isalpha():
+                alpha_count += 1
+
     return ((alpha_count / total_count) < threshold) if total_count > 0 else False
 
 
@@ -306,12 +312,12 @@ def is_us_city_state_zip(text: str) -> bool:
     Doylestown, Pennsylvania, 18901
     DOYLESTOWN, PENNSYLVANIA 18901
     """
-    return US_CITY_STATE_ZIP_RE.match(text.strip()) is not None
+    return US_CITY_STATE_ZIP_RE.fullmatch(text.strip()) is not None
 
 
 def is_email_address(text: str) -> bool:
     """Check if the given text is the email address"""
-    return EMAIL_ADDRESS_PATTERN_RE.match(text.strip()) is not None
+    return EMAIL_ADDRESS_PATTERN_RE.fullmatch(text.strip()) is not None
 
 
 def is_possible_numbered_list(text: str) -> bool:

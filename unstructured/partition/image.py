@@ -5,13 +5,15 @@ from typing import IO, Any, Optional
 from unstructured.chunking import add_chunking_strategy
 from unstructured.documents.elements import Element, process_metadata
 from unstructured.file_utils.filetype import add_metadata
-from unstructured.partition.common import exactly_one
-from unstructured.partition.lang import check_language_args
+from unstructured.partition.common.common import exactly_one
+from unstructured.partition.common.lang import check_language_args
 from unstructured.partition.pdf import partition_pdf_or_image
 from unstructured.partition.utils.constants import PartitionStrategy
+from unstructured.telemetry import partition_runtime_telemetry
 
 
-@process_metadata()
+@partition_runtime_telemetry()
+@process_metadata()  # TODO(shreya): update to use `apply_metadata` decorator
 @add_metadata
 @add_chunking_strategy
 def partition_image(
@@ -21,6 +23,7 @@ def partition_image(
     infer_table_structure: bool = False,
     ocr_languages: Optional[str] = None,
     languages: Optional[list[str]] = None,
+    detect_language_per_element: bool = False,
     strategy: str = PartitionStrategy.HI_RES,
     metadata_last_modified: Optional[str] = None,
     chunking_strategy: Optional[str] = None,
@@ -29,10 +32,10 @@ def partition_image(
     extract_image_block_types: Optional[list[str]] = None,
     extract_image_block_output_dir: Optional[str] = None,
     extract_image_block_to_payload: bool = False,
-    date_from_file_object: bool = False,
     starting_page_number: int = 1,
     extract_forms: bool = False,
     form_extraction_skip_tables: bool = True,
+    password: Optional[str] = None,
     **kwargs: Any,
 ) -> list[Element]:
     """Parses an image into a list of interpreted elements.
@@ -87,18 +90,17 @@ def partition_image(
         Only applicable if `strategy=hi_res` and `extract_image_block_to_payload=False`.
         The filesystem path for saving images of the element type(s)
         specified in 'extract_image_block_types'.
-    date_from_file_object
-        Applies only when providing file via `file` parameter. If this option is True, attempt
-        infer last_modified metadata from bytes, otherwise set it to None.
     extract_forms
         Whether the form extraction logic should be run
         (results in adding FormKeysValues elements to output).
     form_extraction_skip_tables
         Whether the form extraction logic should ignore regions designated as Tables.
+    password
+        The password to decrypt the PDF file.
     """
     exactly_one(filename=filename, file=file)
 
-    languages = check_language_args(languages or [], ocr_languages) or ["eng"]
+    languages = check_language_args(languages or [], ocr_languages)
 
     return partition_pdf_or_image(
         filename=filename,
@@ -107,6 +109,7 @@ def partition_image(
         include_page_breaks=include_page_breaks,
         infer_table_structure=infer_table_structure,
         languages=languages,
+        detect_language_per_element=detect_language_per_element,
         strategy=strategy,
         metadata_last_modified=metadata_last_modified,
         hi_res_model_name=hi_res_model_name,
@@ -114,9 +117,9 @@ def partition_image(
         extract_image_block_types=extract_image_block_types,
         extract_image_block_output_dir=extract_image_block_output_dir,
         extract_image_block_to_payload=extract_image_block_to_payload,
-        date_from_file_object=date_from_file_object,
         starting_page_number=starting_page_number,
         extract_forms=extract_forms,
         form_extraction_skip_tables=form_extraction_skip_tables,
+        password=password,
         **kwargs,
     )

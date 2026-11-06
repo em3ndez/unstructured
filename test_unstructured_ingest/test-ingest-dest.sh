@@ -15,16 +15,17 @@ cd "$SCRIPT_DIR"/.. || exit 1
 export OMP_THREAD_LIMIT=1
 
 all_tests=(
-  'astra.sh'
+  'astradb.sh'
   'azure.sh'
   'azure-cognitive-search.sh'
   'box.sh'
   'chroma.sh'
-  'clarifai.sh'
   'delta-table.sh'
   'dropbox.sh'
   'elasticsearch.sh'
   'gcs.sh'
+  'kafka-local.sh'
+  'mongodb.sh'
   'opensearch.sh'
   'pgvector.sh'
   'pinecone.sh'
@@ -33,8 +34,9 @@ all_tests=(
   'sharepoint-embed-cog-index.sh'
   'sqlite.sh'
   'vectara.sh'
+  'singlestore.sh'
   'weaviate.sh'
-  'mongodb.sh'
+  'databricks-volumes.sh'
 )
 
 full_python_matrix_tests=(
@@ -61,6 +63,8 @@ tests_to_ignore=(
   'notion.sh'
   'dropbox.sh'
   'sharepoint.sh'
+  'databricks-volumes.sh'
+  'vectara.sh'
 )
 
 for test in "${all_tests[@]}"; do

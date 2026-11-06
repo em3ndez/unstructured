@@ -22,17 +22,17 @@ fi
 
 # NOTE(robinson) - per pymongo docs, pymongo ships with its own version of the bson library,
 # which is incompatible with the bson installed from pypi. bson is installed as part of the
-# astra dependencies.
+# astradb dependencies.
 # ref: https://pymongo.readthedocs.io/en/stable/installation.html
-pip uninstall -y bson pymongo
-make install-ingest-mongodb
+uv pip uninstall bson pymongo 2>/dev/null || true
+uv pip install "unstructured-ingest[mongodb]"
 
-PYTHONPATH=. ./unstructured/ingest/main.py \
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
+PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   mongodb \
   --metadata-exclude file_directory,metadata.data_source.date_processed,metadata.last_modified,metadata.date_created,metadata.detection_class_prob,metadata.parent_id,metadata.category_depth \
   --num-processes "$max_processes" \
   --download-dir "$DOWNLOAD_DIR" \
-  --output-dir "$OUTPUT_DIR" \
   --uri "$MONGODB_URI" \
   --database "$MONGODB_DATABASE_NAME" \
   --collection "$SOURCE_MONGO_COLLECTION" \
@@ -40,6 +40,8 @@ PYTHONPATH=. ./unstructured/ingest/main.py \
   --preserve-downloads \
   --reprocess \
   --batch-size 2 \
-  --verbose
+  --verbose \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

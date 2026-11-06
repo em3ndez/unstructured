@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import difflib
 import pathlib
+import types
 from typing import Any, List, Optional
 from unittest.mock import (
     ANY,
@@ -100,6 +101,13 @@ def parse_optional_datetime(datetime_str: Optional[str]) -> Optional[dt.datetime
     return dt.datetime.fromisoformat(datetime_str) if datetime_str else None
 
 
+def input_path(rel_path: str) -> str:
+    """Resolve the absolute-path to `rel_path` in the testfiles directory."""
+    testfiles_dir = pathlib.Path(__file__).parent / "testfiles"
+    file_path = testfiles_dir / rel_path
+    return str(file_path.resolve())
+
+
 # ------------------------------------------------------------------------------------------------
 # MOCKING FIXTURES
 # ------------------------------------------------------------------------------------------------
@@ -128,7 +136,7 @@ def cls_attr_mock(
     attr_name: str,
     name: str | None = None,
     **kwargs: Any,
-):
+) -> Mock:
     """Return a mock for attribute `attr_name` on `cls`.
 
     Patch is reversed after pytest uses it.
@@ -151,7 +159,9 @@ def function_mock(
     return _patch.start()
 
 
-def initializer_mock(request: FixtureRequest, cls: type, autospec: bool = True, **kwargs: Any):
+def initializer_mock(
+    request: FixtureRequest, cls: type, autospec: bool = True, **kwargs: Any
+) -> Mock:
     """Return mock for __init__() method on `cls`.
 
     The patch is reversed after pytest uses it.
@@ -167,7 +177,7 @@ def instance_mock(
     name: str | None = None,
     spec_set: bool = True,
     **kwargs: Any,
-):
+) -> Mock:
     """Return a mock for an instance of `cls` that draws its spec from the class.
 
     The mock does not allow new attributes to be set on the instance. If `name` is missing or
@@ -178,7 +188,7 @@ def instance_mock(
     return create_autospec(cls, _name=name, spec_set=spec_set, instance=True, **kwargs)
 
 
-def loose_mock(request: FixtureRequest, name: str | None = None, **kwargs: Any):
+def loose_mock(request: FixtureRequest, name: str | None = None, **kwargs: Any) -> Mock:
     """Return a "loose" mock, meaning it has no spec to constrain calls on it.
 
     Additional keyword arguments are passed through to Mock(). If called without a name, it is
@@ -195,7 +205,7 @@ def method_mock(
     method_name: str,
     autospec: bool = True,
     **kwargs: Any,
-):
+) -> Mock:
     """Return mock for method `method_name` on `cls`.
 
     The patch is reversed after pytest uses it.
@@ -205,7 +215,23 @@ def method_mock(
     return _patch.start()
 
 
-def open_mock(request: FixtureRequest, module_name: str, **kwargs: Any):
+def stdlib_fn_mock(
+    request: FixtureRequest,
+    std_mod: types.ModuleType,
+    fn_name: str,
+    autospec: bool = True,
+    **kwargs: Any,
+) -> Mock:
+    """Return mock for function `fn_name` on `std_mod`.
+
+    The patch is reversed after pytest uses it.
+    """
+    _patch = patch.object(std_mod, fn_name, autospec=autospec, **kwargs)
+    request.addfinalizer(_patch.stop)
+    return _patch.start()
+
+
+def open_mock(request: FixtureRequest, module_name: str, **kwargs: Any) -> Mock:
     """Return a mock for the builtin `open()` method in `module_name`."""
     target = "%s.open" % module_name
     _patch = patch(target, mock_open(), create=True, **kwargs)
@@ -223,7 +249,7 @@ def property_mock(request: FixtureRequest, cls: type, prop_name: str, **kwargs: 
     return _patch.start()
 
 
-def var_mock(request: FixtureRequest, q_var_name: str, **kwargs: Any):
+def var_mock(request: FixtureRequest, q_var_name: str, **kwargs: Any) -> Mock:
     """Return a mock patching the variable with qualified name `q_var_name`.
 
     Patch is reversed after calling test returns.
@@ -231,3 +257,7 @@ def var_mock(request: FixtureRequest, q_var_name: str, **kwargs: Any):
     _patch = patch(q_var_name, **kwargs)
     request.addfinalizer(_patch.stop)
     return _patch.start()
+
+
+def find_text_in_elements(text: str, elements: List[Element]):
+    return any(el.text.find(text) != -1 for el in elements)

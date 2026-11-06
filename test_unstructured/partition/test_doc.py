@@ -1,21 +1,22 @@
+# pyright: reportPrivateUsage=false
+
 """Test suite for `unstructured.partition.doc` module."""
 
 from __future__ import annotations
 
-import os
 import pathlib
-import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 from pytest_mock import MockFixture
 
 from test_unstructured.unit_utils import (
+    ANY,
     CaptureFixture,
     FixtureRequest,
     assert_round_trips_through_JSON,
     example_doc_path,
-    function_mock,
+    method_mock,
 )
 from unstructured.chunking.basic import chunk_elements
 from unstructured.documents.elements import (
@@ -32,13 +33,8 @@ from unstructured.documents.elements import (
 from unstructured.partition.doc import partition_doc
 from unstructured.partition.docx import partition_docx
 
-is_in_docker = os.path.exists("/.dockerenv")
-
 
 def test_partition_doc_matches_partition_docx(request: FixtureRequest):
-    # NOTE(robinson) - was having issues with the tempfile not being found in the docker tests
-    if is_in_docker:
-        request.applymarker(pytest.mark.xfail)
     doc_file_path = example_doc_path("simple.doc")
     docx_file_path = example_doc_path("simple.docx")
 
@@ -52,7 +48,6 @@ def test_partition_doc_from_filename(expected_elements: list[Element], capsys: C
     elements = partition_doc(example_doc_path("simple.doc"))
 
     assert elements == expected_elements
-    assert all(e.metadata.filename == "simple.doc" for e in elements)
     assert all(e.metadata.file_directory == example_doc_path("") for e in elements)
     assert capsys.readouterr().out == ""
     assert capsys.readouterr().err == ""
@@ -67,7 +62,6 @@ def test_partition_doc_from_file_with_libre_office_filter(
     assert elements == expected_elements
     assert capsys.readouterr().out == ""
     assert capsys.readouterr().err == ""
-    assert all(e.metadata.filename is None for e in elements)
 
 
 def test_partition_doc_from_file_with_no_libre_office_filter(
@@ -102,48 +96,57 @@ def test_partition_raises_with_missing_doc(tmp_path: pathlib.Path):
         partition_doc(filename=doc_filename)
 
 
-# -- `include_metadata` arg ----------------------------------------------------------------------
-
-
-def test_partition_doc_from_filename_excludes_metadata_when_so_instructed():
-    elements = partition_doc(example_doc_path("simple.doc"), include_metadata=False)
-    assert all(e.metadata.to_dict() == {} for e in elements)
-
-
-def test_partition_doc_from_file_excludes_metadata_when_so_instructed():
-    with open(example_doc_path("simple.doc"), "rb") as f:
-        elements = partition_doc(file=f, include_metadata=False)
-
-    assert all(e.metadata.to_dict() == {} for e in elements)
-
-
 # -- .metadata.filename --------------------------------------------------------------------------
 
 
-def test_partition_doc_from_filename_prefers_metadata_filename_when_provided(
-    expected_elements: list[Element],
-):
+def test_partition_doc_from_filename_gets_filename_from_filename_arg():
+    elements = partition_doc(example_doc_path("simple.doc"))
+
+    assert len(elements) > 0
+    assert all(e.metadata.filename == "simple.doc" for e in elements)
+
+
+def test_partition_doc_from_file_gets_filename_None():
+    with open(example_doc_path("simple.doc"), "rb") as f:
+        elements = partition_doc(file=f)
+
+    assert len(elements) > 0
+    assert all(e.metadata.filename is None for e in elements)
+
+
+def test_partition_doc_from_filename_prefers_metadata_filename():
     elements = partition_doc(example_doc_path("simple.doc"), metadata_filename="test")
 
-    assert elements == expected_elements
+    assert len(elements) > 0
     assert all(element.metadata.filename == "test" for element in elements)
 
 
-def test_partition_doc_from_file_prefers_metadata_filename_when_provided():
+def test_partition_doc_from_file_prefers_metadata_filename():
     with open(example_doc_path("simple.doc"), "rb") as f:
         elements = partition_doc(file=f, metadata_filename="test")
 
     assert all(e.metadata.filename == "test" for e in elements)
 
 
+# -- .metadata.filetype --------------------------------------------------------------------------
+
+
+def test_partition_doc_gets_the_DOC_MIME_type_in_metadata_filetype():
+    DOC_MIME_TYPE = "application/msword"
+    elements = partition_doc(example_doc_path("simple.doc"))
+    assert all(e.metadata.filetype == DOC_MIME_TYPE for e in elements), (
+        f"Expected all elements to have '{DOC_MIME_TYPE}' as their filetype, but got:"
+        f" {repr(elements[0].metadata.filetype)}"
+    )
+
+
 # -- .metadata.last_modified ---------------------------------------------------------------------
 
 
-def test_partition_doc_from_filename_pulls_last_modified_from_filesystem(mocker: MockFixture):
+def test_partition_doc_pulls_last_modified_from_filesystem(mocker: MockFixture):
     filesystem_last_modified = "2029-07-05T09:24:28"
     mocker.patch(
-        "unstructured.partition.doc.get_last_modified_date",
-        return_value=filesystem_last_modified,
+        "unstructured.partition.doc.get_last_modified_date", return_value=filesystem_last_modified
     )
 
     elements = partition_doc(example_doc_path("fake.doc"))
@@ -151,7 +154,7 @@ def test_partition_doc_from_filename_pulls_last_modified_from_filesystem(mocker:
     assert all(e.metadata.last_modified == filesystem_last_modified for e in elements)
 
 
-def test_partition_doc_from_filename_prefers_metadata_last_modified_when_provided(
+def test_partition_doc_prefers_metadata_last_modified_when_provided(
     mocker: MockFixture,
 ):
     filesystem_last_modified = "2029-07-05T09:24:28"
@@ -163,61 +166,6 @@ def test_partition_doc_from_filename_prefers_metadata_last_modified_when_provide
     elements = partition_doc(
         example_doc_path("simple.doc"), metadata_last_modified=metadata_last_modified
     )
-
-    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
-
-
-def test_partition_doc_from_file_suppresses_last_modified_from_file_by_default(mocker: MockFixture):
-    modified_date_on_file = "2029-07-05T09:24:28"
-    mocker.patch(
-        "unstructured.partition.doc.get_last_modified_date_from_file",
-        return_value=modified_date_on_file,
-    )
-
-    with open(example_doc_path("simple.doc"), "rb") as f:
-        elements = partition_doc(file=f)
-
-    assert all(e.metadata.last_modified is None for e in elements)
-
-
-def test_partition_doc_from_file_pulls_last_modified_from_file_when_date_from_file_obj_arg_is_True(
-    mocker: MockFixture,
-):
-    modified_date_on_file = "2024-05-01T09:24:28"
-    mocker.patch(
-        "unstructured.partition.doc.get_last_modified_date_from_file",
-        return_value=modified_date_on_file,
-    )
-
-    with open(example_doc_path("simple.doc"), "rb") as f:
-        elements = partition_doc(file=f, date_from_file_object=True)
-
-    assert all(e.metadata.last_modified == modified_date_on_file for e in elements)
-
-
-def test_partition_doc_from_file_gets_None_last_modified_when_file_has_no_last_modified():
-    with open(example_doc_path("simple.doc"), "rb") as f:
-        sf = tempfile.SpooledTemporaryFile()
-        sf.write(f.read())
-        sf.seek(0)
-        elements = partition_doc(file=sf, date_from_file_object=True)
-
-    assert all(e.metadata.last_modified is None for e in elements)
-
-
-def test_partition_doc_from_file_prefers_metadata_last_modified_when_provided(mocker: MockFixture):
-    """Even when `date_from_file_object` arg is `True`."""
-    last_modified_on_file = "2029-07-05T09:24:28"
-    metadata_last_modified = "2020-07-05T09:24:28"
-    mocker.patch(
-        "unstructured.partition.doc.get_last_modified_date_from_file",
-        return_value=last_modified_on_file,
-    )
-
-    with open(example_doc_path("simple.doc"), "rb") as f:
-        elements = partition_doc(
-            file=f, metadata_last_modified=metadata_last_modified, date_from_file_object=True
-        )
 
     assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
 
@@ -248,20 +196,27 @@ def test_partition_doc_respects_detect_language_per_element_arg():
 
 @pytest.mark.parametrize(
     ("kwargs", "expected_value"),
-    [({}, None), ({"strategy": None}, None), ({"strategy": "hi_res"}, "hi_res")],
+    [({}, "hi_res"), ({"strategy": None}, "hi_res"), ({"strategy": "auto"}, "auto")],
 )
-def test_partition_doc_forwards_strategy_arg_to_partition_docx(
+def test_partition_odt_forwards_strategy_arg_to_partition_docx(
     request: FixtureRequest, kwargs: dict[str, Any], expected_value: str | None
 ):
-    partition_docx_ = function_mock(request, "unstructured.partition.doc.partition_docx")
+    from unstructured.partition.docx import _DocxPartitioner
 
-    partition_doc(example_doc_path("simple.doc"), **kwargs)
+    def fake_iter_document_elements(self: _DocxPartitioner) -> Iterator[Element]:
+        yield Text(f"strategy == {self._opts.strategy}")
 
-    call_kwargs = partition_docx_.call_args.kwargs
-    # -- `strategy` keyword-argument appeared in the call --
-    assert "strategy" in call_kwargs
-    # -- `strategy` argument was passed with the expected value --
-    assert call_kwargs["strategy"] == expected_value
+    _iter_elements_ = method_mock(
+        request,
+        _DocxPartitioner,
+        "_iter_document_elements",
+        side_effect=fake_iter_document_elements,
+    )
+
+    (element,) = partition_doc(example_doc_path("simple.doc"), **kwargs)
+
+    _iter_elements_.assert_called_once_with(ANY)
+    assert element.text == f"strategy == {expected_value}"
 
 
 def test_partition_doc_grabs_emphasized_texts():
@@ -320,7 +275,7 @@ def expected_elements() -> list[Element]:
         Title("These are a few of my favorite things:"),
         ListItem("Parrots"),
         ListItem("Hockey"),
-        Title("Analysis"),
+        Text("Analysis"),
         NarrativeText("This is my first thought. This is my second thought."),
         NarrativeText("This is my third thought."),
         Text("2023"),

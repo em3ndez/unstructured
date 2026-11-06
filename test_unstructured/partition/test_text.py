@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import json
-import os
-import pathlib
+import re
 import uuid
-from tempfile import SpooledTemporaryFile
 from typing import Optional, Type
 
 import pytest
@@ -15,16 +14,16 @@ from pytest_mock import MockerFixture
 from test_unstructured.unit_utils import assert_round_trips_through_JSON, example_doc_path
 from unstructured.chunking.title import chunk_by_title
 from unstructured.cleaners.core import group_broken_paragraphs
-from unstructured.documents.elements import Address, ListItem, NarrativeText, Title
-from unstructured.partition.text import (
-    _combine_paragraphs_less_than_min,
-    _split_content_to_fit_max,
-    partition_text,
+from unstructured.documents.elements import (
+    Address,
+    EmailAddress,
+    ListItem,
+    NarrativeText,
+    Title,
 )
+from unstructured.file_utils.model import FileType
+from unstructured.partition.text import partition_text
 from unstructured.partition.utils.constants import UNSTRUCTURED_INCLUDE_DEBUG_METADATA
-
-DIRECTORY = pathlib.Path(__file__).parent.resolve()
-EXAMPLE_DOCS_DIRECTORY = os.path.join(DIRECTORY, "..", "..", "example-docs")
 
 EXPECTED_OUTPUT = [
     NarrativeText(text="This is a test document to use for unit tests."),
@@ -70,8 +69,8 @@ End.
     ],
 )
 def test_partition_text_from_filename(filename: str, encoding: Optional[str]):
-    filename_path = os.path.join(EXAMPLE_DOCS_DIRECTORY, filename)
-    elements = partition_text(filename=filename_path, encoding=encoding)
+    elements = partition_text(example_doc_path(filename), encoding=encoding)
+
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
     for element in elements:
@@ -81,12 +80,10 @@ def test_partition_text_from_filename(filename: str, encoding: Optional[str]):
 
 
 def test_partition_text_from_filename_with_metadata_filename():
-    filename_path = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
     elements = partition_text(
-        filename=filename_path,
-        encoding="utf-8",
-        metadata_filename="test",
+        example_doc_path("fake-text.txt"), encoding="utf-8", metadata_filename="test"
     )
+
     assert elements == EXPECTED_OUTPUT
     for element in elements:
         assert element.metadata.filename == "test"
@@ -97,8 +94,8 @@ def test_partition_text_from_filename_with_metadata_filename():
     ["fake-text-utf-16.txt", "fake-text-utf-16-le.txt", "fake-text-utf-32.txt"],
 )
 def test_partition_text_from_filename_default_encoding(filename: str):
-    filename_path = os.path.join(EXAMPLE_DOCS_DIRECTORY, filename)
-    elements = partition_text(filename=filename_path)
+    elements = partition_text(example_doc_path(filename))
+
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
     for element in elements:
@@ -118,14 +115,116 @@ def test_partition_text_from_filename_raises_econding_error(
     error: Type[BaseException],
 ):
     with pytest.raises(error):
-        filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, filename)
+        filename = example_doc_path(filename)
         partition_text(filename=filename, encoding=encoding)
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Shopping list:\n• milk\n• bread\n",
+            [Title("Shopping list:"), ListItem("milk"), ListItem("bread")],
+        ),
+        (
+            "Fruits:\n  \u25cf apple\n  \u25cf pear\nVegetables:\n  \u25cf carrot\n",
+            [
+                Title("Fruits:"),
+                ListItem("apple"),
+                ListItem("pear"),
+                Title("Vegetables:"),
+                ListItem("carrot"),
+            ],
+        ),
+        (
+            "We need a few things for the weekend.\nShopping list:\n• milk\n• bread\n",
+            [
+                NarrativeText("We need a few things for the weekend. Shopping list:"),
+                ListItem("milk"),
+                ListItem("bread"),
+            ],
+        ),
+        (
+            "Allowed temperature offsets for this process:\n• - 5 \u00b0C\n• 0 \u00b0C\n",
+            [
+                NarrativeText("Allowed temperature offsets for this process:"),
+                ListItem("- 5 \u00b0C"),
+                ListItem("0 \u00b0C"),
+            ],
+        ),
+        # -- a paragraph whose structure is ambiguous is grouped as before --
+        (
+            "Allowed temperature offsets for this process:\r\n•- 5 \u00b0C\r\n• 0 \u00b0C\r\n",
+            [
+                NarrativeText(
+                    "Allowed temperature offsets for this process: •- 5 \u00b0C • 0 \u00b0C"
+                )
+            ],
+        ),
+        (
+            "Requirements:\n• Tighten the bolt to 10 N\u00b7m of torque\n",
+            [NarrativeText("Requirements: • Tighten the bolt to 10 N\u00b7m of torque")],
+        ),
+        (
+            "Requirements:\r\n• This installation must always be *really* safe\r\n",
+            [NarrativeText("Requirements: • This installation must always be *really* safe")],
+        ),
+        (
+            "Fruits:\n• apple\nVegetables:\n• carrots, about 2 \u00b7 3 kg of them from the"
+            " farm market\n",
+            [
+                NarrativeText(
+                    "Fruits: • apple Vegetables: • carrots, about 2 \u00b7 3 kg of them from"
+                    " the farm market"
+                )
+            ],
+        ),
+        (
+            "Observations:\n• Ice formed on the lake\nThe temperature dropped overnight.\n",
+            [
+                NarrativeText(
+                    "Observations: • Ice formed on the lake The temperature dropped overnight."
+                )
+            ],
+        ),
+    ],
+)
+def test_partition_text_reads_a_bulleted_list_that_follows_its_lead_in_line(
+    text: str, expected: list
+):
+    assert partition_text(text=text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Items:\n• first\f• second\n",
+            [Title("Items:"), ListItem("first"), ListItem("second")],
+        ),
+        (
+            "Items:\n• first\fNotes after the list\n",
+            [Title("Items:"), ListItem("first"), Title("Notes after the list")],
+        ),
+    ],
+)
+def test_partition_text_keeps_the_line_split_of_a_configured_paragraph_grouper(
+    text: str, expected: list
+):
+    line_split = re.compile(r"\s*[\n\f]\s*")
+
+    elements = partition_text(
+        text=text,
+        paragraph_grouper=functools.partial(group_broken_paragraphs, line_split=line_split),
+    )
+
+    assert elements == expected
+
+
 def test_partition_text_from_file():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    with open(filename, "rb") as f:
+    with open(example_doc_path("fake-text.txt"), "rb") as f:
         elements = partition_text(file=f)
+
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
     for element in elements:
@@ -133,7 +232,7 @@ def test_partition_text_from_file():
 
 
 def test_partition_text_from_file_with_metadata_filename():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
+    filename = example_doc_path("fake-text.txt")
     with open(filename, "rb") as f:
         elements = partition_text(file=f, metadata_filename="test")
     assert len(elements) > 0
@@ -147,8 +246,7 @@ def test_partition_text_from_file_with_metadata_filename():
     ["fake-text-utf-16.txt", "fake-text-utf-16-le.txt", "fake-text-utf-32.txt"],
 )
 def test_partition_text_from_file_default_encoding(filename: str):
-    filename_path = os.path.join(EXAMPLE_DOCS_DIRECTORY, filename)
-    with open(filename_path, "rb") as f:
+    with open(example_doc_path(filename), "rb") as f:
         elements = partition_text(file=f)
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
@@ -157,9 +255,9 @@ def test_partition_text_from_file_default_encoding(filename: str):
 
 
 def test_partition_text_from_bytes_file():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    with open(filename, "rb") as f:
+    with open(example_doc_path("fake-text.txt"), "rb") as f:
         elements = partition_text(file=f)
+
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
     for element in elements:
@@ -171,9 +269,9 @@ def test_partition_text_from_bytes_file():
     ["fake-text-utf-16.txt", "fake-text-utf-16-le.txt", "fake-text-utf-32.txt"],
 )
 def test_partition_text_from_bytes_file_default_encoding(filename: str):
-    filename_path = os.path.join(EXAMPLE_DOCS_DIRECTORY, filename)
-    with open(filename_path, "rb") as f:
+    with open(example_doc_path(filename), "rb") as f:
         elements = partition_text(file=f)
+
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
     for element in elements:
@@ -181,16 +279,18 @@ def test_partition_text_from_bytes_file_default_encoding(filename: str):
 
 
 def test_text_partition_element_metadata_user_provided_languages():
-    filename = "example-docs/book-war-and-peace-1p.txt"
-    elements = partition_text(filename=filename, strategy="fast", languages=["en"])
+    elements = partition_text(
+        example_doc_path("book-war-and-peace-1p.txt"), strategy="fast", languages=["en"]
+    )
     assert elements[0].metadata.languages == ["eng"]
 
 
 def test_partition_text_from_text():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    with open(filename) as f:
+    with open(example_doc_path("fake-text.txt")) as f:
         text = f.read()
+
     elements = partition_text(text=text)
+
     assert len(elements) > 0
     assert elements == EXPECTED_OUTPUT
     for element in elements:
@@ -207,7 +307,7 @@ def test_partition_text_raises_with_none_specified():
 
 
 def test_partition_text_raises_with_too_many_specified():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
+    filename = example_doc_path("fake-text.txt")
     with open(filename) as f:
         text = f.read()
 
@@ -229,14 +329,54 @@ def test_partition_text_captures_everything_even_with_linebreaks():
         assert element.metadata.filename is None
 
 
-def test_partition_text_groups_broken_paragraphs():
-    text = """The big brown fox
-was walking down the lane.
+def test_partition_text_recognizes_addresses_in_the_first_and_last_listed_states():
+    text = "Birmingham, AL 35203\n\nCheyenne, Wyoming 82001"
 
-At the end of the lane,
-the fox met a bear."""
+    elements = partition_text(text=text)
+
+    assert elements == [
+        Address(text="Birmingham, AL 35203"),
+        Address(text="Cheyenne, Wyoming 82001"),
+    ]
+
+
+def test_partition_text_does_not_make_an_address_of_a_sentence_that_starts_with_one():
+    text = "Doylestown, PA 18901 is where the team met last spring."
+
+    elements = partition_text(text=text)
+
+    assert elements
+    assert not any(isinstance(element, Address) for element in elements)
+
+
+def test_partition_text_keeps_a_sentence_that_starts_with_an_email_address_narrative():
+    text = (
+        "billing@example.com\n"
+        "\n"
+        "billing@example.com is the address for every invoice question you have."
+    )
+
+    elements = partition_text(text=text)
+
+    assert elements == [
+        EmailAddress(text="billing@example.com"),
+        NarrativeText(
+            text="billing@example.com is the address for every invoice question you have."
+        ),
+    ]
+
+
+def test_partition_text_groups_broken_paragraphs():
+    text = (
+        "The big brown fox\n"
+        "was walking down the lane.\n"
+        "\n"
+        "At the end of the lane,\n"
+        "the fox met a bear."
+    )
 
     elements = partition_text(text=text, paragraph_grouper=group_broken_paragraphs)
+
     assert elements == [
         NarrativeText(text="The big brown fox was walking down the lane."),
         NarrativeText(text="At the end of the lane, the fox met a bear."),
@@ -245,111 +385,137 @@ the fox met a bear."""
         assert element.metadata.filename is None
 
 
-def test_partition_text_extract_regex_metadata():
-    text = "SPEAKER 1: It is my turn to speak now!"
-
-    elements = partition_text(text=text, regex_metadata={"speaker": r"SPEAKER \d{1,3}"})
-    assert elements[0].metadata.regex_metadata == {
-        "speaker": [{"text": "SPEAKER 1", "start": 0, "end": 9}],
-    }
-    for element in elements:
-        assert element.metadata.filename is None
-
-
-def test_partition_text_splits_long_text():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
-    elements = partition_text(filename=filename)
-    assert len(elements) > 0
-    assert elements[0].text.startswith("Iwan Roberts")
-    assert elements[-1].text.endswith("External links")
-
-
-def test_partition_text_splits_long_text_max_partition():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
-    elements = partition_text(filename=filename)
-    elements_max_part = partition_text(filename=filename, max_partition=500)
-    # NOTE(klaijan) - I edited the operation here from < to <=
-    # Please revert back if this does not make sense
-    assert len(elements) <= len(elements_max_part)
-    for element in elements_max_part:
-        assert len(element.text) <= 500
-
-    # Make sure combined text is all the same
-    assert " ".join([el.text for el in elements]) == " ".join([el.text for el in elements_max_part])
-
-
-def test_partition_text_splits_max_min_partition():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
-    elements = partition_text(filename=filename)
-    elements_max_part = partition_text(filename=filename, min_partition=1000, max_partition=1500)
-    for i, element in enumerate(elements_max_part):
-        # NOTE(robinson) - the last element does not have a next element to merge with,
-        # so it can be short
-        if i < len(elements_max_part) - 1:
-            assert len(element.text) <= 1500
-            assert len(element.text) >= 1000
-
-    import re
-
-    from unstructured.nlp.patterns import BULLETS_PATTERN
-
-    # NOTE(klaijan) - clean the asterik out of both text.
-    # The `elements` was partitioned by new line and thus makes line 56 (shown below)
-    # "*Club domestic league appearances and goals"
-    # be considered as a bullet point by the function is_bulleted_text
-    # and so the asterik was removed from the paragraph
-    # whereas `elements_max_part` was partitioned differently and thus none of the line
-    # starts with any of the BULLETS_PATTERN.
-
-    # TODO(klaijan) - when edit the function partition_text to support non-bullet paragraph
-    # that starts with bullet-like BULLETS_PATTERN, remove the re.sub part from the assert below.
-
-    # Make sure combined text is all the same
-    assert re.sub(BULLETS_PATTERN, "", " ".join([el.text for el in elements])) == re.sub(
-        BULLETS_PATTERN,
-        "",
-        " ".join([el.text for el in elements_max_part]),
-    )
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Phone: 555-123-4567\n\nEnd", ["Phone: 555-123-4567", "End"]),
+        ("SSN: 123-45-6789\n\nEnd", ["SSN: 123-45-6789", "End"]),
+        ("Date: 2026-08-19\n\nEnd", ["Date: 2026-08-19", "End"]),
+        ("Card: 4111-1111-1111-1111\n\nEnd", ["Card: 4111-1111-1111-1111", "End"]),
+        (
+            "IBAN: GB29-NWBK-6016-1331-9268-19\n\nEnd",
+            ["IBAN: GB29-NWBK-6016-1331-9268-19", "End"],
+        ),
+        (
+            "trace_id: 550e8400-e29b-41d4-a716-446655440000\n\nEnd",
+            ["trace_id: 550e8400-e29b-41d4-a716-446655440000", "End"],
+        ),
+        ("Contact: Jean-Luc Picard\n\nEnd", ["Contact: Jean-Luc Picard", "End"]),
+        ("name: my-service\n\nEnd", ["name: my-service", "End"]),
+        (
+            "2026-08-19 ERROR conn-pool-3 failed\n\nEnd",
+            ["2026-08-19 ERROR conn-pool-3 failed", "End"],
+        ),
+        # -- CJK text never satisfies the space-separated `all_lines_short` guard --
+        ("連絡先：090-1234-5678\n\n住所：東京", ["連絡先：090-1234-5678", "住所：東京"]),
+        # -- en-dash (U+2013) is ambiguous in the same way as U+002D --
+        ("Range: 10–20\n\nEnd", ["Range: 10–20", "End"]),
+    ],
+)
+def test_partition_text_does_not_split_hyphenated_values(text: str, expected: list[str]):
+    """A hyphen is intra-word punctuation, not an unanchored bullet delimiter."""
+    assert [e.text for e in partition_text(text=text)] == expected
 
 
-def test_partition_text_min_max():
-    segments = partition_text(text=SHORT_PARAGRAPHS, min_partition=6)
-    for i, segment in enumerate(segments):
-        # NOTE(robinson) - the last element does not have a next element to merge with,
-        # so it can be short
-        if i < len(segments) - 1:
-            assert len(segment.text) >= 6
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # -- unambiguous bullet glyphs still split inline --
+        (
+            "Shopping list\n\n• milk • eggs • bread\n\nDone",
+            ["Shopping list", "milk", "eggs", "bread", "Done"],
+        ),
+        # -- dash bullets at line start are still bullets --
+        (
+            "Agenda\n\n- first item here\n- second item here\n\nDone",
+            ["Agenda", "first item here", "second item here", "Done"],
+        ),
+        # -- ...and a hyphen inside such an item is left alone --
+        (
+            "Agenda\n\n- deploy my-service now\n- check state-of-the-art\n\nDone",
+            ["Agenda", "deploy my-service now", "check state-of-the-art", "Done"],
+        ),
+        # -- indented/nested dash bullets still split --
+        (
+            "Agenda\n\n- top one\n  - nested my-service\n\nDone",
+            ["Agenda", "top one", "nested my-service", "Done"],
+        ),
+        # -- indentation in extracted text is not always an ASCII space: NO-BREAK SPACE
+        # -- (U+00A0), EM SPACE (U+2003) and a tab must all read as indentation --
+        (
+            "Agenda\n\n- top one\n\u00a0- nbsp nested\n\u2003- em nested\n\t- tab nested\n\nDone",
+            ["Agenda", "top one", "nbsp nested", "em nested", "tab nested", "Done"],
+        ),
+        # -- en-dash bullets at line start still split --
+        (
+            "Agenda\n\n– first item here\n– second item here\n\nDone",
+            ["Agenda", "first item here", "second item here", "Done"],
+        ),
+        # -- NOTE: declared behavior change. Inline dash bullets on a single line no
+        # -- longer split. Keeping hyphenated identifiers intact is worth the trade.
+        ("Agenda\n\n- one - two - three\n\nDone", ["Agenda", "one - two - three", "Done"]),
+    ],
+)
+def test_partition_text_still_recognizes_bullets(text: str, expected: list[str]):
+    assert [e.text for e in partition_text(text=text)] == expected
 
-    segments = partition_text(text=SHORT_PARAGRAPHS, max_partition=20, min_partition=7)
-    for i, segment in enumerate(segments):
-        # NOTE(robinson) - the last element does not have a next element to merge with,
-        # so it can be short
-        if i < len(segments) - 1:
-            assert len(segment.text) >= 7
-            assert len(segment.text) <= 20
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # -- a leading minus sign is not a bullet; stripping it flips the value --
+        ("-123.45\n\nDone", [("Text", "-123.45"), ("Title", "Done")]),
+        ("–10 °C\n\nDone", [("Text", "–10 °C"), ("Title", "Done")]),
+        ("-5\n\nDone", [("Text", "-5"), ("Title", "Done")]),
+        # -- a bullet is separated from the item it introduces; this is not --
+        ("-item\n\nDone", [("Title", "-item"), ("Title", "Done")]),
+        # -- ...whereas an unambiguous glyph needs no separator --
+        ("•item\n\nDone", [("ListItem", "item"), ("Title", "Done")]),
+        # -- a separated dash is still a bullet --
+        ("- item\n\nDone", [("ListItem", "item"), ("Title", "Done")]),
+        # -- a lone dash is an empty bullet and is dropped entirely; this exercises the
+        # -- end-of-text branch of the qualifier and `_is_empty_bullet` --
+        ("-\n\nDone", [("Title", "Done")]),
+        ("–\n\nDone", [("Title", "Done")]),
+    ],
+)
+def test_partition_text_does_not_mistake_signs_for_bullets(
+    text: str, expected: list[tuple[str, str]]
+):
+    assert [(type(e).__name__, e.text) for e in partition_text(text=text)] == expected
 
 
-def test_split_content_to_fit_max():
-    segments = _split_content_to_fit_max(
-        content=MIN_MAX_TEXT,
-        max_partition=75,
-    )
-    assert segments == [
-        "This is a story.",
-        "This is a story that doesn't matter because",
-        "it is just being used as an example. Hi. Hello. Howdy. Hola.",
-        "The example is simple and repetitive and long",
-        "and somewhat boring, but it serves a purpose. End.",
+def test_partition_text_keeps_signs_on_lines_wrapped_under_a_bullet():
+    """Continuation lines starting with a negative number keep their sign.
+
+    They are folded into the bullet item above rather than each becoming a bullet whose
+    minus sign is stripped.
+    """
+    text = "- readings\n-5 °C\n-10 °C\n\nDone"
+
+    assert [(type(e).__name__, e.text) for e in partition_text(text=text)] == [
+        ("ListItem", "readings -5 °C -10 °C"),
+        ("Title", "Done"),
     ]
 
 
-def test_combine_paragraphs_less_than_min():
-    segments = _combine_paragraphs_less_than_min(
-        SHORT_PARAGRAPHS.split("\n\n"),
-        max_partition=1500,
-        min_partition=7,
-    )
-    assert len(segments) < len(SHORT_PARAGRAPHS)
+def test_partition_text_keeps_short_unrelated_lines_separate():
+    """The Apache-License case the comment in `group_broken_paragraphs` cites."""
+    text = "Apache License\nVersion 2.0, January 2004\nhttp://www.apache.org/licenses/\n\nEnd"
+
+    assert [e.text for e in partition_text(text=text)] == [
+        "Apache License",
+        "Version 2.0, January 2004",
+        "http://www.apache.org/licenses/",
+        "End",
+    ]
+
+
+def test_partition_text_splits_long_text():
+    elements = partition_text(example_doc_path("norwich-city.txt"))
+    assert len(elements) > 0
+    assert elements[0].text.startswith("Iwan Roberts")
+    assert elements[-1].text.endswith("External links")
 
 
 def test_partition_text_doesnt_get_page_breaks():
@@ -360,151 +526,122 @@ def test_partition_text_doesnt_get_page_breaks():
     assert not isinstance(elements[0], ListItem)
 
 
-@pytest.mark.parametrize(
-    ("filename", "encoding"),
-    [
-        ("fake-text.txt", "utf-8"),
-        ("fake-text.txt", None),
-        ("fake-text-utf-16-be.txt", "utf-16-be"),
-    ],
-)
-def test_partition_text_from_filename_exclude_metadata(filename: str, encoding: Optional[str]):
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, filename)
-    elements = partition_text(
-        filename=filename,
-        encoding=encoding,
-        include_metadata=False,
+# -- .metadata.filename --------------------------------------------------------------------------
+
+
+def test_partition_text_from_filename_gets_filename_metadata_from_file_path():
+    elements = partition_text(example_doc_path("fake-text.txt"))
+
+    assert all(e.metadata.filename == "fake-text.txt" for e in elements)
+    assert all(e.metadata.file_directory == example_doc_path("") for e in elements)
+
+
+def test_partition_text_from_file_gets_filename_metadata_None():
+    with open(example_doc_path("fake-text.txt"), "rb") as f:
+        elements = partition_text(file=f)
+
+    assert all(e.metadata.filename is None for e in elements)
+    assert all(e.metadata.file_directory is None for e in elements)
+
+
+def test_partition_text_from_filename_prefers_metadata_filename():
+    elements = partition_text(example_doc_path("fake-text.txt"), metadata_filename="a/b/c.txt")
+
+    assert all(e.metadata.filename == "c.txt" for e in elements)
+    assert all(e.metadata.file_directory == "a/b" for e in elements)
+
+
+def test_partition_text_from_file_prefers_metadata_filename():
+    with open(example_doc_path("fake-text.txt"), "rb") as f:
+        elements = partition_text(file=f, metadata_filename="d/e/f.txt")
+
+    assert all(e.metadata.filename == "f.txt" for e in elements)
+    assert all(e.metadata.file_directory == "d/e" for e in elements)
+
+
+# -- .metadata.filetype --------------------------------------------------------------------------
+
+
+def test_partition_text_gets_the_TXT_MIME_type_in_metadata_filetype():
+    TXT_MIME_TYPE = "text/plain"
+    elements = partition_text(example_doc_path("fake-text.txt"))
+    assert all(e.metadata.filetype == TXT_MIME_TYPE for e in elements), (
+        f"Expected all elements to have '{TXT_MIME_TYPE}' as their filetype, but got:"
+        f" {repr(elements[0].metadata.filetype)}"
     )
-    for i in range(len(elements)):
-        assert elements[i].metadata.to_dict() == {}
 
 
-def test_partition_text_from_file_exclude_metadata():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    with open(filename, "rb") as f:
-        elements = partition_text(file=f, include_metadata=False)
-    for i in range(len(elements)):
-        assert elements[i].metadata.to_dict() == {}
+def test_partition_text_prefers_metadata_file_type():
+    elements = partition_text(example_doc_path("README.md"), metadata_file_type=FileType.MD)
+    assert all(e.metadata.filetype == "text/markdown" for e in elements), (
+        f"Expected all elements to have 'text/markdown' as their filetype, but got:"
+        f" {repr(elements[0].metadata.filetype)}"
+    )
 
 
-def test_partition_text_metadata_date(mocker: MockerFixture):
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    mocked_last_modification_date = "2029-07-05T09:24:28"
+# -- .metadata.last_modified ---------------------------------------------------------------------
 
+
+def test_partition_text_from_file_path_gets_last_modified_from_filesystem(mocker: MockerFixture):
+    filesystem_last_modified = "2029-07-05T09:24:28"
     mocker.patch(
-        "unstructured.partition.text.get_last_modified_date",
-        return_value=mocked_last_modification_date,
+        "unstructured.partition.text.get_last_modified_date", return_value=filesystem_last_modified
     )
 
-    elements = partition_text(
-        filename=filename,
-    )
+    elements = partition_text(example_doc_path("fake-text.txt"))
 
-    assert elements[0].metadata.last_modified == mocked_last_modification_date
+    assert all(e.metadata.last_modified == filesystem_last_modified for e in elements)
 
 
-def test_partition_text_with_custom_metadata_date(mocker: MockerFixture):
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-    expected_last_modification_date = "2020-07-05T09:24:28"
+def test_partition_text_from_file_gets_last_modified_None():
+    with open(example_doc_path("fake-text.txt"), "rb") as f:
+        elements = partition_text(file=f)
 
-    mocker.patch(
-        "unstructured.partition.text.get_last_modified_date",
-        return_value=mocked_last_modification_date,
-    )
-
-    elements = partition_text(
-        filename=filename,
-        metadata_last_modified=expected_last_modification_date,
-    )
-
-    assert elements[0].metadata.last_modified == expected_last_modification_date
+    assert all(e.metadata.last_modified is None for e in elements)
 
 
-def test_partition_text_from_file_metadata_date(mocker: MockerFixture):
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-
-    mocker.patch(
-        "unstructured.partition.text.get_last_modified_date_from_file",
-        return_value=mocked_last_modification_date,
-    )
-
-    with open(filename, "rb") as f:
-        elements = partition_text(
-            file=f,
-        )
-
-    assert elements[0].metadata.last_modified is None
-
-
-def test_partition_text_from_file_explicit_get_metadata_date(mocker: MockerFixture):
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-
-    mocker.patch(
-        "unstructured.partition.text.get_last_modified_date_from_file",
-        return_value=mocked_last_modification_date,
-    )
-
-    with open(filename, "rb") as f:
-        elements = partition_text(
-            file=f,
-            date_from_file_object=True,
-        )
-
-    assert elements[0].metadata.last_modified == mocked_last_modification_date
-
-
-def test_partition_text_from_file_with_custom_metadata_date(mocker: MockerFixture):
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    mocked_last_modification_date = "2029-07-05T09:24:28"
-    expected_last_modification_date = "2020-07-05T09:24:28"
-
-    mocker.patch(
-        "unstructured.partition.text.get_last_modified_date_from_file",
-        return_value=mocked_last_modification_date,
-    )
-
-    with open(filename, "rb") as f:
-        elements = partition_text(file=f, metadata_last_modified=expected_last_modification_date)
-
-    assert elements[0].metadata.last_modified == expected_last_modification_date
-
-
-def test_partition_text_from_text_metadata_date():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    with open(filename) as f:
+def test_partition_text_from_text_gets_last_modified_None():
+    with open(example_doc_path("fake-text.txt")) as f:
         text = f.read()
 
-    elements = partition_text(
-        text=text,
+    elements = partition_text(text=text)
+
+    assert all(e.metadata.last_modified is None for e in elements)
+
+
+def test_partition_text_from_file_path_prefers_metadata_last_modified(mocker: MockerFixture):
+    filesystem_last_modified = "2029-07-05T09:24:28"
+    metadata_last_modified = "2020-07-05T09:24:28"
+    mocker.patch(
+        "unstructured.partition.text.get_last_modified_date", return_value=filesystem_last_modified
     )
-    assert elements[0].metadata.last_modified is None
+
+    elements = partition_text(
+        example_doc_path("fake-text.txt"), metadata_last_modified=metadata_last_modified
+    )
+
+    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
 
 
-def test_partition_text_from_text_with_custom_metadata_date():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    expected_last_modification_date = "2020-07-05T09:24:28"
+def test_partition_text_from_file_prefers_metadata_last_modified():
+    metadata_last_modified = "2020-07-05T09:24:28"
+    with open(example_doc_path("fake-text.txt"), "rb") as f:
+        elements = partition_text(file=f, metadata_last_modified=metadata_last_modified)
 
-    with open(filename) as f:
+    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
+
+
+def test_partition_text_from_text_prefers_metadata_last_modified():
+    metadata_last_modified = "2020-07-05T09:24:28"
+    with open(example_doc_path("fake-text.txt")) as f:
         text = f.read()
 
-    elements = partition_text(text=text, metadata_last_modified=expected_last_modification_date)
+    elements = partition_text(text=text, metadata_last_modified=metadata_last_modified)
 
-    assert elements[0].metadata.last_modified == expected_last_modification_date
+    assert all(e.metadata.last_modified == metadata_last_modified for e in elements)
 
 
-def test_partition_text_from_file_without_metadata_date():
-    """Test partition_text() with file that are not possible to get last modified date"""
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "fake-text.txt")
-    with open(filename, "rb") as f:
-        sf = SpooledTemporaryFile()
-        sf.write(f.read())
-        sf.seek(0)
-        elements = partition_text(file=sf, date_from_file_object=True)
-
-    assert elements[0].metadata.last_modified is None
+# ------------------------------------------------------------------------------------------------
 
 
 def test_Text_element_assigns_id_hashes_that_are_unique_and_deterministic():
@@ -540,7 +677,7 @@ def test_partition_text_with_json(file_name: str, encoding: str | None):
 
 
 def test_add_chunking_strategy_on_partition_text():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
+    filename = example_doc_path("book-war-and-peace-1p.txt")
     elements = partition_text(filename=filename)
     chunk_elements = partition_text(filename, chunking_strategy="by_title")
     chunks = chunk_by_title(elements)
@@ -549,34 +686,39 @@ def test_add_chunking_strategy_on_partition_text():
 
 
 def test_partition_text_element_metadata_has_languages():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
-    elements = partition_text(filename=filename)
+    elements = partition_text(example_doc_path("norwich-city.txt"))
     assert elements[0].metadata.languages == ["eng"]
 
 
 def test_partition_text_respects_detect_language_per_element():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "language-docs", "eng_spa_mult.txt")
-    elements = partition_text(filename=filename, detect_language_per_element=True)
+    elements = partition_text(
+        example_doc_path("language-docs/eng_spa_mult.txt"), detect_language_per_element=True
+    )
+
     langs = [element.metadata.languages for element in elements]
+
     assert langs == [["eng"], ["spa", "eng"], ["eng"], ["eng"], ["spa"]]
 
 
 def test_partition_text_respects_languages_arg():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
-    elements = partition_text(filename=filename, languages=["deu"])
+    elements = partition_text(example_doc_path("norwich-city.txt"), languages=["deu"])
     assert elements[0].metadata.languages == ["deu"]
 
 
 def test_partition_text_element_metadata_raises_TypeError():
     with pytest.raises(TypeError):
-        filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "norwich-city.txt")
-        partition_text(filename=filename, languages="eng")  # type: ignore
+        partition_text(example_doc_path("norwich-city.txt"), languages="eng")
+
+
+def test_partition_text_keeps_languages_arg_on_short_ascii_text():
+    elements = partition_text(text="Bonjour le monde", languages=["fra"])
+    assert [e.metadata.languages for e in elements] == [["fra"]]
 
 
 def test_partition_text_detects_more_than_3_languages():
-    filename = os.path.join(EXAMPLE_DOCS_DIRECTORY, "language-docs", "UDHR_first_article_all.txt")
-    elements = partition_text(filename=filename, detect_language_per_element=True)
-    langs = list(
-        {element.metadata.languages[0] for element in elements if element.metadata.languages},
+    elements = partition_text(
+        example_doc_path("language-docs/UDHR_first_article_all.txt"),
+        detect_language_per_element=True,
     )
+    langs = [e.metadata.languages[0] for e in elements if e.metadata.languages]
     assert len(langs) > 10

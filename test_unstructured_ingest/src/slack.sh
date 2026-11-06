@@ -29,7 +29,7 @@ if [ -z "$SLACK_TOKEN" ]; then
   exit 8
 fi
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   slack \
   --num-processes "$max_processes" \
@@ -38,12 +38,13 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --strategy hi_res \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
-  --channels C052BGT7718 \
+  --channels C07ABKJ83C6 \
   --token "${SLACK_TOKEN}" \
   --start-date 2023-04-01 \
-  --end-date 2023-04-08T12:00:00-08:00 \
-  --work-dir "$WORK_DIR"
+  --end-date 2024-07-01T07:47:00-07:00 \
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

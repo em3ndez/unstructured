@@ -1,43 +1,40 @@
 from __future__ import annotations
 
-from typing import IO, Any, Optional
+import contextlib
+import shutil
+import tempfile
+from typing import IO, Any, Iterator, Optional, cast
 
-import pandas as pd
-from lxml.html.soupparser import fromstring as soupparser_fromstring
+from pandas.io.common import get_handle
 
 from unstructured.chunking import add_chunking_strategy
-from unstructured.documents.elements import (
-    Element,
-    ElementMetadata,
-    Table,
-    process_metadata,
-)
-from unstructured.file_utils.filetype import FileType, add_metadata_with_filetype
-from unstructured.partition.common import (
+from unstructured.common.html_table import HtmlTable
+from unstructured.documents.elements import Element, ElementMetadata, Table
+from unstructured.file_utils.model import FileType
+from unstructured.partition.common.common import (
     exactly_one,
-    get_last_modified_date,
-    get_last_modified_date_from_file,
-    spooled_to_bytes_io_if_needed,
+    rewind_if_spooled,
 )
-from unstructured.partition.lang import apply_lang_metadata
+from unstructured.partition.common.metadata import apply_metadata, get_last_modified_date
+from unstructured.partition.csv import (
+    check_cell_count,
+    dataframe_to_html,
+    read_delimited_text,
+)
+from unstructured.telemetry import partition_runtime_telemetry
 
 DETECTION_ORIGIN: str = "tsv"
 
 
-@process_metadata()
-@add_metadata_with_filetype(FileType.TSV)
+@partition_runtime_telemetry("tsv")
+@apply_metadata(FileType.TSV)
 @add_chunking_strategy
 def partition_tsv(
     filename: Optional[str] = None,
+    *,
     file: Optional[IO[bytes]] = None,
-    metadata_filename: Optional[str] = None,
-    metadata_last_modified: Optional[str] = None,
     include_header: bool = False,
-    include_metadata: bool = True,
-    languages: Optional[list[str]] = ["auto"],
-    # NOTE (jennings) partition_tsv generates a single TableElement
-    # so detect_language_per_element is not included as a param
-    date_from_file_object: bool = False,
+    infer_table_structure: bool = True,
     **kwargs: Any,
 ) -> list[Element]:
     """Partitions TSV files into document elements.
@@ -50,51 +47,72 @@ def partition_tsv(
         A file-like object using "rb" mode --> open(filename, "rb").
     include_header
         Determines whether or not header info info is included in text and medatada.text_as_html.
-    include_metadata
-        Determines whether or not metadata is included in the output.
-    metadata_last_modified
-        The day of the last modification.
-    languages
-        User defined value for `metadata.languages` if provided. Otherwise language is detected
-        using naive Bayesian filter via `langdetect`. Multiple languages indicates text could be
-        in either language.
-    date_from_file_object
-        Applies only when providing file via `file` parameter. If this option is True, attempt
-        infer last_modified metadata from bytes, otherwise set it to None.
+    infer_table_structure
+        If True, any Table elements that are extracted will also have a metadata field
+        named "text_as_html" where the table's text content is rendered into an html string.
+        I.e., rows and cells are preserved.
+        Whether True or False, the "text" field is always present in any Table element
+        and is the text content of the table (no structure).
     """
     exactly_one(filename=filename, file=file)
 
-    last_modification_date = None
     header = 0 if include_header else None
 
     if filename:
-        table = pd.read_csv(filename, sep="\t", header=header)
-        last_modification_date = get_last_modified_date(filename)
-    elif file:
+        # -- like `pd.read_csv(filename)`, decompress a file named e.g. "x.tsv.gz"; the size check
+        # -- and the read each get their own decompressing handle on the same content --
+        with _open_decompressed(filename) as f:
+            check_cell_count(f, "\t", None, header=include_header)
+        with _open_decompressed(filename) as f:
+            dataframe = read_delimited_text(f, sep="\t", header=header, encoding=None)
+    else:
+        assert file is not None
         # -- Note(scanny): `SpooledTemporaryFile` on Python<3.11 does not implement `.readable()`
         # -- which triggers an exception on `pd.DataFrame.read_csv()` call.
-        f = spooled_to_bytes_io_if_needed(file)
-        table = pd.read_csv(f, sep="\t", header=header)
-        last_modification_date = (
-            get_last_modified_date_from_file(file) if date_from_file_object else None
-        )
+        f = rewind_if_spooled(file)
+        with _rereadable(f) as f:
+            start = f.tell()
+            check_cell_count(f, "\t", None, header=include_header)
+            f.seek(start)
+            dataframe = read_delimited_text(f, sep="\t", header=header, encoding=None)
 
-    html_text = table.to_html(index=False, header=include_header, na_rep="")
-    text = soupparser_fromstring(html_text).text_content()
+    html_table = HtmlTable.from_html_text(dataframe_to_html(dataframe, header=include_header))
 
-    if include_metadata:
-        metadata = ElementMetadata(
-            text_as_html=html_text,
-            filename=metadata_filename or filename,
-            last_modified=metadata_last_modified or last_modification_date,
-            languages=languages,
-        )
-        metadata.detection_origin = DETECTION_ORIGIN
-    else:
-        metadata = ElementMetadata()
-
-    elements = apply_lang_metadata(
-        [Table(text=text, metadata=metadata)],
-        languages=languages,
+    metadata = ElementMetadata(
+        filename=filename,
+        last_modified=get_last_modified_date(filename) if filename else None,
+        text_as_html=html_table.html if infer_table_structure else None,
     )
-    return list(elements)
+    metadata.detection_origin = DETECTION_ORIGIN
+
+    return [Table(text=html_table.text, metadata=metadata)]
+
+
+@contextlib.contextmanager
+def _open_decompressed(filename: str) -> Iterator[IO[bytes]]:
+    """Open `filename` for reading bytes, decompressed as its extension (e.g. ".gz") implies."""
+    with get_handle(filename, "rb", compression="infer", is_text=False) as handles:
+        yield cast(IO[bytes], handles.handle)
+
+
+@contextlib.contextmanager
+def _rereadable(file: IO[bytes]) -> Iterator[IO[bytes]]:
+    """`file` itself if it can seek, otherwise a spooled copy of the rest of it.
+
+    The size check and the read each read the file, so a stream that cannot seek back (e.g. a
+    pipe or socket) is copied once to a temporary file, which spills to disk when large.
+    """
+    try:
+        seekable = file.seekable()
+    except (AttributeError, ValueError):
+        seekable = False
+    if seekable:
+        yield file
+        return
+    with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_MEMORY_BYTES) as copy:
+        shutil.copyfileobj(file, copy)
+        copy.seek(0)
+        yield cast(IO[bytes], copy)
+
+
+_SPOOL_MAX_MEMORY_BYTES = 64 * 1024 * 1024

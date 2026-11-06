@@ -8,9 +8,8 @@ import functools
 import hashlib
 import os
 import pathlib
-import re
 import uuid
-from itertools import groupby
+from functools import cached_property
 from types import MappingProxyType
 from typing import Any, Callable, FrozenSet, Optional, Sequence, cast
 
@@ -22,7 +21,7 @@ from unstructured.documents.coordinates import (
     RelativeCoordinateSystem,
 )
 from unstructured.partition.utils.constants import UNSTRUCTURED_INCLUDE_DEBUG_METADATA
-from unstructured.utils import get_call_args_applying_defaults, lazyproperty
+from unstructured.utils import get_call_args_applying_defaults
 
 Point: TypeAlias = "tuple[float, float]"
 Points: TypeAlias = "tuple[Point, ...]"
@@ -127,14 +126,6 @@ class CoordinatesMetadata:
         return cls(points=points, system=system)
 
 
-class RegexMetadata(TypedDict):
-    """Metadata that is extracted from a document element via regex."""
-
-    text: str
-    start: int
-    end: int
-
-
 class Link(TypedDict):
     """Metadata related to extracted links"""
 
@@ -167,6 +158,8 @@ class ElementMetadata:
     #   to consolidate this new metadata field from each pre-chunk element during chunking.
     # - Add field-name to DEBUG_FIELD_NAMES if it shouldn't appear in dict/JSON or participate in
     #   equality comparison.
+    # - Add field-name to SEPARATELY_SERIALIZED_FIELD_NAMES if `.to_dict()` replaces its value
+    #   with a serialized form, so it is not deep-copied first.
 
     attached_to_filename: Optional[str]
     category_depth: Optional[int]
@@ -176,11 +169,17 @@ class ElementMetadata:
     detection_class_prob: Optional[float]
     # -- DEBUG field, the detection mechanism that emitted this element --
     detection_origin: Optional[str]
+    # -- per-attribute model provenance for enrichments. Maps a written attribute name (e.g.
+    # -- "text", "text_as_html", "embeddings") to a list of records in application order, each
+    # -- {"type", "provider", "model"}. Authoring enrichments overwrite (reset the list);
+    # -- additive enrichments append (preserving the prior author). --
+    enrichment_origins: Optional[dict[str, list[dict[str, str]]]]
     emphasized_text_contents: Optional[list[str]]
     emphasized_text_tags: Optional[list[str]]
     file_directory: Optional[str]
     filename: Optional[str]
     filetype: Optional[str]
+    image_url: Optional[str]
     image_path: Optional[str]
     image_base64: Optional[str]
     image_mime_type: Optional[str]
@@ -202,32 +201,62 @@ class ElementMetadata:
     # -- page numbers currently supported for DOCX, HTML, PDF, and PPTX documents --
     page_number: Optional[int]
     parent_id: Optional[str]
-    # -- "fields" e.g. status, dept.no, etc. extracted from text via regex --
-    regex_metadata: Optional[dict[str, list[RegexMetadata]]]
+
+    # -- routing decision (page-level) --
+    routing: Optional[str]
+    routing_score: Optional[float]
 
     # -- e-mail specific metadata fields --
+    bcc_recipient: Optional[list[str]]
+    cc_recipient: Optional[list[str]]
+    email_message_id: Optional[str]
     sent_from: Optional[list[str]]
     sent_to: Optional[list[str]]
     subject: Optional[str]
     signature: Optional[str]
+    # -- name of the paragraph-style in the source document, e.g. "Title" or "Heading 1".
+    # -- DOCX only for now, where `category_depth` alone cannot tell a document title from a
+    # -- first-level heading (both are 0). See `partition.docx` and issue #4557. --
+    style_name: Optional[str]
 
     # -- used for Table elements to capture rows/col structure --
     text_as_html: Optional[str]
+    is_extracted: Optional[str]
     table_as_cells: Optional[dict[str, str | int]]
+    table_extraction_method: Optional[str]  # "grid", "tatr", or "vlm"
+
+    # -- used for TableChunk elements to enable table reconstruction --
+    table_id: Optional[str]
+    chunk_index: Optional[int]
+    num_carried_over_header_rows: Optional[int]
     url: Optional[str]
+
+    # -- speech-to-text segment timestamps (seconds) when element is from partition_audio --
+    segment_end_seconds: Optional[float]
+    segment_start_seconds: Optional[float]
 
     # -- debug fields can be assigned and referenced using dotted-notation but are not serialized
     # -- to dict/JSON, do not participate in equality comparison, and are not included in the
     # -- `.fields` dict used by other parts of the library like chunking and weaviate.
     DEBUG_FIELD_NAMES = frozenset(["detection_origin"])
 
+    #: Fields that `.to_dict()` replaces with their serialized form. Deep-copying them there
+    #: would only build a copy that is thrown away on the next few lines, and `orig_elements` on
+    #: a chunk holds every source element of that chunk.
+    SEPARATELY_SERIALIZED_FIELD_NAMES = frozenset(
+        ["coordinates", "data_source", "orig_elements", "key_value_pairs"]
+    )
+
     def __init__(
         self,
         attached_to_filename: Optional[str] = None,
+        bcc_recipient: Optional[list[str]] = None,
         category_depth: Optional[int] = None,
+        cc_recipient: Optional[list[str]] = None,
         coordinates: Optional[CoordinatesMetadata] = None,
         data_source: Optional[DataSourceMetadata] = None,
         detection_class_prob: Optional[float] = None,
+        enrichment_origins: Optional[dict[str, list[dict[str, str]]]] = None,
         emphasized_text_contents: Optional[list[str]] = None,
         emphasized_text_tags: Optional[list[str]] = None,
         file_directory: Optional[str] = None,
@@ -236,6 +265,7 @@ class ElementMetadata:
         header_footer_type: Optional[str] = None,
         image_base64: Optional[str] = None,
         image_mime_type: Optional[str] = None,
+        image_url: Optional[str] = None,
         image_path: Optional[str] = None,
         is_continuation: Optional[bool] = None,
         languages: Optional[list[str]] = None,
@@ -244,24 +274,36 @@ class ElementMetadata:
         link_texts: Optional[list[str]] = None,
         link_urls: Optional[list[str]] = None,
         links: Optional[list[Link]] = None,
+        email_message_id: Optional[str] = None,
         orig_elements: Optional[list[Element]] = None,
         page_name: Optional[str] = None,
         page_number: Optional[int] = None,
         parent_id: Optional[str] = None,
-        regex_metadata: Optional[dict[str, list[RegexMetadata]]] = None,
+        routing: Optional[str] = None,
+        routing_score: Optional[float] = None,
         sent_from: Optional[list[str]] = None,
         sent_to: Optional[list[str]] = None,
         signature: Optional[str] = None,
         subject: Optional[str] = None,
         table_as_cells: Optional[dict[str, str | int]] = None,
+        table_extraction_method: Optional[str] = None,
+        table_id: Optional[str] = None,
+        chunk_index: Optional[int] = None,
+        num_carried_over_header_rows: Optional[int] = None,
         text_as_html: Optional[str] = None,
         url: Optional[str] = None,
+        segment_end_seconds: Optional[float] = None,
+        segment_start_seconds: Optional[float] = None,
+        style_name: Optional[str] = None,
     ) -> None:
         self.attached_to_filename = attached_to_filename
+        self.bcc_recipient = bcc_recipient
         self.category_depth = category_depth
+        self.cc_recipient = cc_recipient
         self.coordinates = coordinates
         self.data_source = data_source
         self.detection_class_prob = detection_class_prob
+        self.enrichment_origins = enrichment_origins
         self.emphasized_text_contents = emphasized_text_contents
         self.emphasized_text_tags = emphasized_text_tags
 
@@ -278,6 +320,7 @@ class ElementMetadata:
         self.header_footer_type = header_footer_type
         self.image_base64 = image_base64
         self.image_mime_type = image_mime_type
+        self.image_url = image_url
         self.image_path = image_path
         self.is_continuation = is_continuation
         self.languages = languages
@@ -286,18 +329,27 @@ class ElementMetadata:
         self.link_urls = link_urls
         self.link_start_indexes = link_start_indexes
         self.links = links
+        self.email_message_id = email_message_id
         self.orig_elements = orig_elements
         self.page_name = page_name
         self.page_number = page_number
         self.parent_id = parent_id
-        self.regex_metadata = regex_metadata
+        self.routing = routing
+        self.routing_score = routing_score
         self.sent_from = sent_from
         self.sent_to = sent_to
         self.signature = signature
         self.subject = subject
         self.text_as_html = text_as_html
         self.table_as_cells = table_as_cells
+        self.table_extraction_method = table_extraction_method
+        self.table_id = table_id
+        self.chunk_index = chunk_index
+        self.num_carried_over_header_rows = num_carried_over_header_rows
         self.url = url
+        self.segment_end_seconds = segment_end_seconds
+        self.segment_start_seconds = segment_start_seconds
+        self.style_name = style_name
 
     def __eq__(self, other: object) -> bool:
         """Implments equivalence, like meta == other_meta.
@@ -391,7 +443,14 @@ class ElementMetadata:
         """
         from unstructured.staging.base import elements_to_base64_gzipped_json
 
-        meta_dict = copy.deepcopy(dict(self.fields))
+        # -- copy the fields a caller could mutate to reach back into this metadata, but not the
+        # -- ones replaced by their serialized form below. Those stay in place as placeholders so
+        # -- the reassignments keep their original key position --
+        fields = self.fields
+        copied = copy.deepcopy(
+            {k: v for k, v in fields.items() if k not in self.SEPARATELY_SERIALIZED_FIELD_NAMES}
+        )
+        meta_dict = {k: copied.get(k, v) for k, v in fields.items()}
 
         # -- remove fields that should not be serialized --
         for field_name in self.DEBUG_FIELD_NAMES:
@@ -436,7 +495,7 @@ class ElementMetadata:
         for field_name, field_value in other.fields.items():
             setattr(self, field_name, field_value)
 
-    @lazyproperty
+    @cached_property
     def _known_field_names(self) -> FrozenSet[str]:
         """field-names for non-user-defined fields, available on all ElementMetadata instances.
 
@@ -462,14 +521,19 @@ class ConsolidationStrategy(enum.Enum):
     FIRST = "first"
     """Use the first value encountered, omit if not present in any elements."""
 
+    STRING_CONCATENATE = "string_concatenate"
+    """Combine the values of this field across elements. Only suitable for fields of `str` type."""
+
     LIST_CONCATENATE = "LIST_CONCATENATE"
     """Concatenate the list values across elements. Only suitable for fields of `List` type."""
 
     LIST_UNIQUE = "list_unique"
     """Union list values across elements, preserving order. Only suitable for `List` fields."""
 
-    REGEX = "regex"
-    """Combine regex-metadata of elements, adjust start and stop offsets for concatenated text."""
+    DICT_LIST_UNIQUE = "dict_list_unique"
+    """Merge dict-of-list values across elements: union keys, and per key concatenate the lists
+    then drop duplicate records, preserving first-seen order. Suitable for `dict[str, list]`
+    fields like `enrichment_origins`."""
 
     @classmethod
     def field_consolidation_strategies(cls) -> dict[str, ConsolidationStrategy]:
@@ -481,40 +545,58 @@ class ConsolidationStrategy(enum.Enum):
         """
         return {
             "attached_to_filename": cls.FIRST,
+            "cc_recipient": cls.FIRST,
+            "bcc_recipient": cls.FIRST,
             "category_depth": cls.DROP,
             "coordinates": cls.DROP,
             "data_source": cls.FIRST,
             "detection_class_prob": cls.DROP,
             "detection_origin": cls.DROP,
+            "enrichment_origins": cls.DICT_LIST_UNIQUE,
             "emphasized_text_contents": cls.LIST_CONCATENATE,
             "emphasized_text_tags": cls.LIST_CONCATENATE,
             "file_directory": cls.FIRST,
             "filename": cls.FIRST,
             "filetype": cls.FIRST,
             "header_footer_type": cls.DROP,
+            "image_url": cls.DROP,
             "image_path": cls.DROP,
             "image_base64": cls.DROP,
             "image_mime_type": cls.DROP,
             "is_continuation": cls.DROP,  # -- not expected, added by chunking, not before --
+            "is_extracted": cls.DROP,
             "languages": cls.LIST_UNIQUE,
             "last_modified": cls.FIRST,
             "link_texts": cls.LIST_CONCATENATE,
             "link_urls": cls.LIST_CONCATENATE,
             "link_start_indexes": cls.DROP,
             "links": cls.DROP,  # -- deprecated field --
+            "email_message_id": cls.FIRST,
             "max_characters": cls.DROP,  # -- unused, remove from ElementMetadata --
             "orig_elements": cls.DROP,  # -- not expected, added by chunking, not before --
             "page_name": cls.FIRST,
             "page_number": cls.FIRST,
             "parent_id": cls.DROP,
-            "regex_metadata": cls.REGEX,
+            "routing": cls.DROP,
+            "routing_score": cls.DROP,
             "sent_from": cls.FIRST,
             "sent_to": cls.FIRST,
             "signature": cls.FIRST,
+            "style_name": cls.DROP,  # -- DROP like category_depth: a chunk spans mixed styles --
             "subject": cls.FIRST,
-            "text_as_html": cls.FIRST,  # -- only occurs in Table --
+            "text_as_html": cls.STRING_CONCATENATE,
             "table_as_cells": cls.FIRST,  # -- only occurs in Table --
+            "table_extraction_method": cls.FIRST,
+            "table_id": cls.DROP,  # -- added by chunking, not before --
+            "chunk_index": cls.DROP,  # -- added by chunking, not before --
+            "num_carried_over_header_rows": cls.DROP,  # -- added by chunking, not before --
             "url": cls.FIRST,
+            # TODO: ideally a chunk spanning multiple audio segments would keep min(start) and
+            # max(end) across its constituent elements. ConsolidationStrategy currently has no
+            # MIN/MAX variants, so DROP is the safe fallback for now. Add MIN/MAX strategies
+            # and switch these to cls.MIN / cls.MAX when that work is done.
+            "segment_start_seconds": cls.DROP,
+            "segment_end_seconds": cls.DROP,
             "key_value_pairs": cls.DROP,  # -- only occurs in FormKeysValues --
         }
 
@@ -536,10 +618,15 @@ def assign_and_map_hash_ids(elements: list[Element]) -> list[Element]:
         List of updated Element objects with hashes for `id` and `parent_id`.
     """
     # -- generate sequence number for each element on a page --
+    # -- Count per page number, not per contiguous run of equal page numbers: otherwise the
+    # -- sequence number of an element depends on which elements precede it and two elements that
+    # -- share their text on a page that is not contiguous in this list collide.
     page_numbers = [e.metadata.page_number for e in elements]
-    page_seq_pairs = [
-        seq_on_page for page, group in groupby(page_numbers) for seq_on_page, _ in enumerate(group)
-    ]
+    page_seq_counts: dict[int | None, int] = {}
+    page_seq_pairs: list[int] = []
+    for page_number in page_numbers:
+        page_seq_pairs.append(page_seq_counts.get(page_number, 0))
+        page_seq_counts[page_number] = page_seq_pairs[-1] + 1
 
     # -- assign hash IDs to elements --
     old_to_new_mapping = {
@@ -550,7 +637,7 @@ def assign_and_map_hash_ids(elements: list[Element]) -> list[Element]:
     # -- map old parent IDs to new ones --
     for e in elements:
         parent_id = e.metadata.parent_id
-        if not parent_id:
+        if not parent_id or parent_id not in old_to_new_mapping:
             continue
         e.metadata.parent_id = old_to_new_mapping[parent_id]
 
@@ -562,14 +649,13 @@ def process_metadata() -> Callable[[Callable[_P, list[Element]]], Callable[_P, l
 
     This decorator adds a post-processing step to a document partitioner.
 
-    - Adds `metadata_filename` and `include_metadata` parameters to docstring if not present.
-    - Adds `.metadata.regex-metadata` when `regex_metadata` keyword-argument is provided.
+    - Adds `metadata_filename` parameter to docstring if not present.
     - Updates element.id to a UUID when `unique_element_ids` argument is provided and True.
 
     """
 
     def decorator(func: Callable[_P, list[Element]]) -> Callable[_P, list[Element]]:
-        if func.__doc__:
+        if func.__doc__:  # noqa: SIM102
             if (
                 "metadata_filename" in func.__code__.co_varnames
                 and "metadata_filename" not in func.__doc__
@@ -578,27 +664,11 @@ def process_metadata() -> Callable[[Callable[_P, list[Element]]], Callable[_P, l
                     "\nMetadata Parameters:\n\tmetadata_filename:"
                     + "\n\t\tThe filename to use in element metadata."
                 )
-            if (
-                "include_metadata" in func.__code__.co_varnames
-                and "include_metadata" not in func.__doc__
-            ):
-                func.__doc__ += (
-                    "\n\tinclude_metadata:"
-                    + """\n\t\tDetermines whether or not metadata is included in the metadata
-                    attribute on the elements in the output."""
-                )
 
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> list[Element]:
             elements = func(*args, **kwargs)
             call_args = get_call_args_applying_defaults(func, *args, **kwargs)
-
-            regex_metadata: dict["str", "str"] = call_args.get("regex_metadata", {})
-            # -- don't write an empty `{}` to metadata.regex_metadata when no regex-metadata was
-            # -- requested, otherwise it will serialize (because it's not None) when it has no
-            # -- meaning or is even misleading. Also it complicates tests that don't use regex-meta.
-            if regex_metadata:
-                elements = _add_regex_metadata(elements, regex_metadata)
 
             unique_element_ids: bool = call_args.get("unique_element_ids", False)
             if unique_element_ids is False:
@@ -609,36 +679,6 @@ def process_metadata() -> Callable[[Callable[_P, list[Element]]], Callable[_P, l
         return wrapper
 
     return decorator
-
-
-def _add_regex_metadata(
-    elements: list[Element],
-    regex_metadata: dict[str, str] = {},
-) -> list[Element]:
-    """Adds metadata based on a user provided regular expression.
-
-    The additional metadata will be added to the regex_metadata attrbuted in the element metadata.
-    """
-    for element in elements:
-        if isinstance(element, Text):
-            _regex_metadata: dict["str", list[RegexMetadata]] = {}
-            for field_name, pattern in regex_metadata.items():
-                results: list[RegexMetadata] = []
-                for result in re.finditer(pattern, element.text):
-                    start, end = result.span()
-                    results.append(
-                        {
-                            "text": element.text[start:end],
-                            "start": start,
-                            "end": end,
-                        },
-                    )
-                if len(results) > 0:
-                    _regex_metadata[field_name] = results
-
-            element.metadata.regex_metadata = _regex_metadata
-
-    return elements
 
 
 class ElementType:
@@ -685,6 +725,7 @@ class ElementType:
     PAGE_NUMBER = "PageNumber"
     CODE_SNIPPET = "CodeSnippet"
     FORM_KEYS_VALUES = "FormKeysValues"
+    DOCUMENT_DATA = "DocumentData"
 
     @classmethod
     def to_dict(cls):
@@ -726,9 +767,7 @@ class Element(abc.ABC):
         metadata: Optional[ElementMetadata] = None,
         detection_origin: Optional[str] = None,
     ):
-        if element_id is not None and not isinstance(
-            element_id, str
-        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+        if element_id is not None and not isinstance(element_id, str):  # type: ignore
             raise ValueError("element_id must be of type str or None.")
 
         self._element_id = element_id
@@ -862,7 +901,7 @@ class Text(Element):
         embeddings: Optional[list[float]] = None,
     ):
         metadata = metadata if metadata else ElementMetadata()
-        self.text: str = text
+        self.text: str = "" if text is None else text
         self.embeddings: Optional[list[float]] = embeddings
 
         super().__init__(
@@ -886,7 +925,7 @@ class Text(Element):
         )
 
     def __str__(self):
-        return self.text
+        return "" if self.text is None else self.text
 
     def apply(self, *cleaners: Callable[[str], str]):
         """Applies a cleaning brick to the text element.
@@ -944,6 +983,12 @@ class NarrativeText(Text):
     category = "NarrativeText"
 
 
+class Form(Text):
+    """An element for capturing form text."""
+
+    category = "Form"
+
+
 class ListItem(Text):
     """ListItem is a NarrativeText element that is part of a list."""
 
@@ -989,7 +1034,7 @@ class Table(Text):
 class TableChunk(Table):
     """An element for capturing chunks of tables."""
 
-    category = "Table"
+    category = "TableChunk"
 
 
 class Header(Text):
@@ -1022,6 +1067,14 @@ class FormKeysValues(Text):
     category = "FormKeysValues"
 
 
+class DocumentData(Text):
+    """An element for capturing document-level data,
+    particularly for large data that does not make sense to
+    represent across each element in the document."""
+
+    category = "DocumentData"
+
+
 TYPE_TO_TEXT_ELEMENT_MAP: dict[str, type[Text]] = {
     ElementType.TITLE: Title,
     ElementType.SECTION_HEADER: Title,
@@ -1036,7 +1089,7 @@ TYPE_TO_TEXT_ELEMENT_MAP: dict[str, type[Text]] = {
     # this mapping favors ensures yolox produces backward compatible categories
     ElementType.ABSTRACT: NarrativeText,
     ElementType.THREADING: NarrativeText,
-    ElementType.FORM: NarrativeText,
+    ElementType.FORM: Form,
     ElementType.VALUE: NarrativeText,
     ElementType.LINK: NarrativeText,
     ElementType.LIST_ITEM: ListItem,
@@ -1060,10 +1113,11 @@ TYPE_TO_TEXT_ELEMENT_MAP: dict[str, type[Text]] = {
     ElementType.CODE_SNIPPET: CodeSnippet,
     ElementType.PAGE_NUMBER: PageNumber,
     ElementType.FORM_KEYS_VALUES: FormKeysValues,
+    ElementType.DOCUMENT_DATA: DocumentData,
 }
 
 
-def _kvform_rehydrate_internal_elements(kv_pairs: list[dict]) -> list[FormKeyValuePair]:
+def _kvform_rehydrate_internal_elements(kv_pairs: list[dict[str, Any]]) -> list[FormKeyValuePair]:
     """
     The key_value_pairs metadata field contains (in the vast majority of cases)
     nested Text elements. Those need to be turned from dicts into Elements explicitly,
@@ -1081,17 +1135,17 @@ def _kvform_rehydrate_internal_elements(kv_pairs: list[dict]) -> list[FormKeyVal
             (kv_pair["value"]["custom_element"],) = elements_from_dicts(
                 [kv_pair["value"]["custom_element"]]
             )
-    return kv_pairs
+    return cast(list[FormKeyValuePair], kv_pairs)
 
 
-def _kvform_pairs_to_dict(kv_pairs: list[FormKeyValuePair]) -> list[dict]:
+def _kvform_pairs_to_dict(orig_kv_pairs: list[FormKeyValuePair]) -> list[dict[str, Any]]:
     """
     The key_value_pairs metadata field contains (in the vast majority of cases)
     nested Text elements. Those need to be turned from Elements to dicts recursively,
     e.g. when FormKeysValues.to_dict() is used.
 
     """
-    kv_pairs: list[dict] = copy.deepcopy(kv_pairs)
+    kv_pairs: list[dict[str, Any]] = copy.deepcopy(orig_kv_pairs)  # type: ignore
     for kv_pair in kv_pairs:
         if kv_pair["key"]["custom_element"] is not None:
             kv_pair["key"]["custom_element"] = kv_pair["key"]["custom_element"].to_dict()

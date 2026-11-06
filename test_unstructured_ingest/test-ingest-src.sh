@@ -4,6 +4,7 @@ set -u -o pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 SKIPPED_FILES_LOG=$SCRIPT_DIR/skipped-files.txt
+PYTHON=${PYTHON:-python}
 # If the file already exists, reset it
 if [ -f "$SKIPPED_FILES_LOG" ]; then
   rm "$SKIPPED_FILES_LOG"
@@ -17,64 +18,17 @@ EVAL_OUTPUT_ROOT=${EVAL_OUTPUT_ROOT:-$SCRIPT_DIR}
 export OMP_THREAD_LIMIT=1
 
 all_tests=(
-  's3.sh'
   's3-minio.sh'
+  'astradb.sh'
   'azure.sh'
-  'biomed-api.sh'
-  'biomed-path.sh'
   # NOTE(yuming): The pdf-fast-reprocess test should be put after any tests that save downloaded files
   'pdf-fast-reprocess.sh'
-  'salesforce.sh'
-  'box.sh'
-  'discord.sh'
-  'dropbox.sh'
-  'github.sh'
-  'gitlab.sh'
-  'google-drive.sh'
-  'wikipedia.sh'
   'local.sh'
-  'slack.sh'
-  'against-api.sh'
-  'gcs.sh'
-  'onedrive.sh'
-  'outlook.sh'
-  'elasticsearch.sh'
-  'confluence-diff.sh'
-  'confluence-large.sh'
-  'airtable-diff.sh'
-  # # NOTE(ryan): This test is disabled because it is triggering too many requests to the API
-  # 'airtable-large.sh'
   'local-single-file.sh'
   'local-single-file-basic-chunking.sh'
   'local-single-file-chunk-no-orig-elements.sh'
   'local-single-file-with-encoding.sh'
   'local-single-file-with-pdf-infer-table-structure.sh'
-  'notion.sh'
-  'delta-table.sh'
-  'jira.sh'
-  'sharepoint.sh'
-  'sharepoint-with-permissions.sh'
-  'hubspot.sh'
-  'local-embed.sh'
-  'local-embed-bedrock.sh'
-  'local-embed-octoai.sh'
-  'local-embed-vertexai.sh'
-  'local-embed-voyageai.sh'
-  'sftp.sh'
-  'opensearch.sh'
-  'mongodb.sh'
-)
-
-full_python_matrix_tests=(
-  'sharepoint.sh'
-  'local.sh'
-  'local-single-file.sh'
-  'local-single-file-with-encoding.sh'
-  'local-single-file-with-pdf-infer-table-structure.sh'
-  's3.sh'
-  'google-drive.sh'
-  'gcs.sh'
-  'azure.sh'
 )
 
 CURRENT_TEST="none"
@@ -89,21 +43,14 @@ function print_last_run() {
 
 trap print_last_run EXIT
 
-python_version=$(python --version 2>&1)
-
 tests_to_ignore=(
   'notion.sh'
-  'dropbox.sh'
+  'local-embed-mixedbreadai.sh'
+  'hubspot.sh'
 )
 
 for test in "${all_tests[@]}"; do
   CURRENT_TEST="$test"
-  # IF: python_version is not 3.10 (wildcarded to match any subminor version) AND the current test is not in full_python_matrix_tests
-  # Note: to test we expand the full_python_matrix_tests array to a string and then regex match the current test
-  if [[ "$python_version" != "Python 3.10"* ]] && [[ ! "${full_python_matrix_tests[*]}" =~ $test ]]; then
-    echo "--------- SKIPPING SCRIPT $test ---------"
-    continue
-  fi
   echo "--------- RUNNING SCRIPT $test ---------"
   echo "Running ./test_unstructured_ingest/$test"
   ./test_unstructured_ingest/src/"$test"

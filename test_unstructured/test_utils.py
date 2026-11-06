@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import tempfile
 
 import pytest
 
 from unstructured import utils
 from unstructured.documents.coordinates import PixelSpace
-from unstructured.documents.elements import ElementMetadata, NarrativeText, Title
+from unstructured.documents.elements import ElementMetadata, NarrativeText, Table, Title
 
 
 @pytest.fixture()
@@ -115,6 +115,17 @@ def test_only_raises_when_len_more_than_1(iterator):
 def test_only_raises_if_empty(iterator):
     with pytest.raises(ValueError):
         utils.only(iterator)
+
+
+def test_a_box_nested_with_no_tolerance_is_inside_its_parent():
+    parent = (0, 0, 100, 100)
+    child = (10, 10, 20, 20)
+    assert utils.is_parent_box(parent, child) is True
+    assert utils.is_parent_box(parent, child, add=0) is True
+    assert utils.is_parent_box(parent, (15, 15)) is True
+    assert utils.is_parent_box(parent, (200, 200, 210, 210)) is False
+    assert utils.is_parent_box(parent, (-1, -1, 10, 10)) is False
+    assert utils.is_parent_box(parent, (-1, -1, 10, 10), add=1) is True
 
 
 @pytest.mark.parametrize(
@@ -313,54 +324,91 @@ def test_catch_overlapping_and_nested_bboxes_non_overlapping_case():
     assert overlapping_cases == []
 
 
-def test_validate_data_args():
-    assert utils.validate_date_args("2020-10-10") is True
+@pytest.mark.parametrize("n_filler", [0, 100, 1000])
+def test_catch_overlapping_and_nested_bboxes_keeps_category_past_element_99(n_filler):
+    coordinate_system = PixelSpace(width=1000, height=1000)
+    fillers = [
+        NarrativeText(
+            text=f"filler {i}",
+            coordinates=((0, i), (0, i + 1), (5, i + 1), (5, i)),
+            coordinate_system=coordinate_system,
+            metadata=ElementMetadata(page_number=1),
+        )
+        for i in range(n_filler)
+    ]
+    elements = fillers + [
+        Table(
+            text="cell a cell b",
+            coordinates=((0, 0), (0, 500), (500, 500), (500, 0)),
+            coordinate_system=coordinate_system,
+            metadata=ElementMetadata(page_number=2),
+        ),
+        Title(
+            text="cell a",
+            coordinates=((10, 10), (10, 50), (100, 50), (100, 10)),
+            coordinate_system=coordinate_system,
+            metadata=ElementMetadata(page_number=2),
+        ),
+    ]
 
-    with pytest.raises(ValueError):
-        utils.validate_date_args("blah")
+    overlapping_flag, overlapping_cases = utils.catch_overlapping_and_nested_bboxes(elements)
 
-    with pytest.raises(ValueError):
-        utils.validate_date_args(None)
-
-
-@pytest.mark.parametrize(
-    "date", ["1990-12-01", "2050-01-01T00:00:00", "2050-01-01+00:00:00", "2022-02-12T14:30:00-0500"]
-)
-def test_validate_date_args_accepts_standard_formats(date):
-    assert utils.validate_date_args(date)
-
-
-@pytest.mark.parametrize("date", [None, "not a date", "1990-12-33"])
-def test_validate_date_args_raises_for_invalid_formats(date):
-    pattern1 = re.compile(r"The argument.*?(?:is None).*")
-    pattern2 = re.compile(r"The argument.*?(?:does not satisfy the format: YYYY-MM-DD).*")
-    combined_pattern = re.compile(f"({pattern1.pattern}|{pattern2.pattern})")
-    with pytest.raises(ValueError, match=combined_pattern):
-        assert utils.validate_date_args(date)
-
-
-def test_htmlify_matrix_handles_empty_cells():
-    assert utils.htmlify_matrix_of_cell_texts([["cell1", "", "cell3"], ["", "cell5", ""]]) == (
-        "<table><tr><td>cell1</td><td></td><td>cell3</td></tr>"
-        "<tr><td></td><td>cell5</td><td></td></tr></table>"
-    )
-
-
-def test_htmlify_matrix_handles_special_characters():
-    assert utils.htmlify_matrix_of_cell_texts([['<>&"', "newline\n"]]) == (
-        "<table><tr><td>&lt;&gt;&amp;&quot;</td><td>newline<br/></td></tr></table>"
-    )
+    assert overlapping_flag is True
+    assert overlapping_cases[0]["overlapping_elements"] == [
+        f"Table(ix={n_filler})",
+        f"Title(ix={n_filler + 1})",
+    ]
+    assert overlapping_cases[0]["overlapping_case"] == "nested Title in Table"
 
 
-def test_htmlify_matrix_handles_multiple_rows_and_cells():
-    assert utils.htmlify_matrix_of_cell_texts([["cell1", "cell2"], ["cell3", "cell4"]]) == (
-        "<table><tr><td>cell1</td><td>cell2</td></tr>"
-        "<tr><td>cell3</td><td>cell4</td></tr></table>"
-    )
+def test_catch_overlapping_and_nested_bboxes_returns_no_cases_for_no_elements():
+    overlapping_flag, overlapping_cases = utils.catch_overlapping_and_nested_bboxes([])
+
+    assert overlapping_flag is False
+    assert overlapping_cases == []
 
 
-def test_htmlify_matrix_handles_empty_matrix():
-    assert utils.htmlify_matrix_of_cell_texts([]) == ""
+def test_catch_overlapping_and_nested_bboxes_compares_elements_that_have_no_page_number():
+    # -- elements from a partitioner that assigns no page-number are all on page 1 --
+    elements = [
+        Title(
+            text="a nested title",
+            coordinates=((4, 6), (4, 7), (7, 7), (7, 6)),
+            coordinate_system=PixelSpace(width=20, height=20),
+        ),
+        NarrativeText(
+            text="text in the same box",
+            coordinates=((4, 6), (4, 7), (7, 7), (7, 6)),
+            coordinate_system=PixelSpace(width=20, height=20),
+        ),
+    ]
+
+    overlapping_flag, overlapping_cases = utils.catch_overlapping_and_nested_bboxes(elements)
+
+    assert overlapping_flag is True
+    assert overlapping_cases[0]["overlapping_case"] == "nested NarrativeText in Title"
+
+
+def test_catch_overlapping_and_nested_bboxes_handles_pages_that_are_not_in_ascending_order():
+    elements = [
+        Title(
+            text="title on the second page",
+            coordinates=((4, 6), (4, 7), (7, 7), (7, 6)),
+            coordinate_system=PixelSpace(width=20, height=20),
+            metadata=ElementMetadata(page_number=2),
+        ),
+        NarrativeText(
+            text="text on the first page",
+            coordinates=((4, 6), (4, 7), (7, 7), (7, 6)),
+            coordinate_system=PixelSpace(width=20, height=20),
+            metadata=ElementMetadata(page_number=1),
+        ),
+    ]
+
+    overlapping_flag, overlapping_cases = utils.catch_overlapping_and_nested_bboxes(elements)
+
+    assert overlapping_flag is False
+    assert overlapping_cases == []
 
 
 def test_only_returns_singleton_iterable():
@@ -382,3 +430,80 @@ def test_calculate_shared_ngram_percentage_returns_null_vals_for_empty_str():
     percent, common_ngrams = utils.calculate_shared_ngram_percentage(str1, str2, n)
     assert percent == 0
     assert not bool(common_ngrams)
+
+
+class DescribeGroupElementsByParentId:
+    """Unit tests for group_elements_by_parent_id function."""
+
+    def it_groups_elements_by_parent_id_with_orphans_in_none_group(self):
+        e1 = Title("Title 1")
+        e1.metadata.parent_id = "parent_A"
+        e2 = NarrativeText("Child of A")
+        e2.metadata.parent_id = "parent_A"
+        e3 = NarrativeText("Orphan 1")  # parent_id = None
+        e4 = Title("Title 2")
+        e4.metadata.parent_id = "parent_B"
+        e5 = NarrativeText("Orphan 2")  # parent_id = None
+
+        elements = [e1, e2, e3, e4, e5]
+        result = utils.group_elements_by_parent_id(elements)
+
+        assert list(result.keys()) == ["parent_A", None, "parent_B"]
+        assert [e.text for e in result["parent_A"]] == ["Title 1", "Child of A"]
+        assert [e.text for e in result[None]] == ["Orphan 1", "Orphan 2"]
+        assert [e.text for e in result["parent_B"]] == ["Title 2"]
+
+    def it_assigns_orphans_to_previous_element_group_when_assign_orphans_is_true(self):
+        e1 = Title("Title 1")
+        e1.metadata.parent_id = "parent_A"
+        e2 = NarrativeText("Child of A")
+        e2.metadata.parent_id = "parent_A"
+        e3 = NarrativeText("Orphan 1")  # parent_id = None
+        e4 = Title("Title 2")
+        e4.metadata.parent_id = "parent_B"
+        e5 = NarrativeText("Orphan 2")  # parent_id = None
+
+        elements = [e1, e2, e3, e4, e5]
+        result = utils.group_elements_by_parent_id(elements, assign_orphans=True)
+
+        assert list(result.keys()) == ["parent_A", "parent_B"]
+        assert [e.text for e in result["parent_A"]] == ["Title 1", "Child of A", "Orphan 1"]
+        assert [e.text for e in result["parent_B"]] == ["Title 2", "Orphan 2"]
+
+    def it_keeps_first_orphan_in_none_group_when_assign_orphans_is_true(self):
+        e1 = NarrativeText("First orphan")  # parent_id = None
+        e2 = Title("Title 1")
+        e2.metadata.parent_id = "parent_A"
+        e3 = NarrativeText("Orphan 2")  # parent_id = None
+
+        elements = [e1, e2, e3]
+        result = utils.group_elements_by_parent_id(elements, assign_orphans=True)
+
+        assert list(result.keys()) == [None, "parent_A"]
+        assert [e.text for e in result[None]] == ["First orphan"]
+        assert [e.text for e in result["parent_A"]] == ["Title 1", "Orphan 2"]
+
+
+def _stub_temp_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> str:
+    """Point the process temp dir at ``tmp_path`` and return it as a string."""
+    temp_dir = tmp_path / "tmp"
+    temp_dir.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp_dir))
+    return str(temp_dir)
+
+
+def test_is_temp_file_path_detects_a_file_inside_the_temp_dir(monkeypatch, tmp_path):
+    temp_dir = _stub_temp_dir(monkeypatch, tmp_path)
+    file_path = os.path.join(temp_dir, "page.csv")
+
+    assert utils.is_temp_file_path(file_path) is True
+
+
+def test_is_temp_file_path_is_not_a_name_prefix_test(monkeypatch, tmp_path):
+    """A sibling directory that merely starts with the temp-dir name is not temporary."""
+    temp_dir = _stub_temp_dir(monkeypatch, tmp_path)
+    sibling = temp_dir + "-exports"
+    os.mkdir(sibling)
+    file_path = os.path.join(sibling, "page.csv")
+
+    assert utils.is_temp_file_path(file_path) is False

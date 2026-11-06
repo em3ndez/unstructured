@@ -4,38 +4,26 @@ import os
 import tempfile
 from typing import IO, Any, Optional
 
-from unstructured.chunking import add_chunking_strategy
-from unstructured.documents.elements import Element, process_metadata
-from unstructured.file_utils.filetype import FileType, add_metadata_with_filetype
-from unstructured.partition.common import (
-    convert_office_doc,
-    exactly_one,
-    get_last_modified_date,
-    get_last_modified_date_from_file,
-)
+from unstructured.documents.elements import Element
+from unstructured.file_utils.model import FileType
+from unstructured.partition.common.common import convert_office_doc, exactly_one
+from unstructured.partition.common.metadata import get_last_modified_date
 from unstructured.partition.docx import partition_docx
+from unstructured.telemetry import partition_runtime_telemetry
 
 
-@process_metadata()
-@add_metadata_with_filetype(FileType.DOC)
-@add_chunking_strategy
+@partition_runtime_telemetry("doc")
 def partition_doc(
     filename: Optional[str] = None,
     file: Optional[IO[bytes]] = None,
-    include_page_breaks: bool = True,
-    include_metadata: bool = True,
     metadata_filename: Optional[str] = None,
     metadata_last_modified: Optional[str] = None,
     libre_office_filter: Optional[str] = "MS Word 2007 XML",
-    chunking_strategy: Optional[str] = None,
-    languages: Optional[list[str]] = ["auto"],
-    detect_language_per_element: bool = False,
-    date_from_file_object: bool = False,
-    starting_page_number: int = 1,
-    strategy: Optional[str] = None,
     **kwargs: Any,
 ) -> list[Element]:
     """Partitions Microsoft Word Documents in .doc format into its document elements.
+
+    All parameters available on `partition_docx()` are also available here.
 
     Parameters
     ----------
@@ -56,9 +44,6 @@ def partition_doc(
         Additional Parameters:
             detect_language_per_element
                 Detect language per element instead of at the document level.
-    date_from_file_object
-        Applies only when providing file via `file` parameter. If this option is True, attempt
-        infer last_modified metadata from bytes, otherwise set it to None.
     starting_page_number
         Indicates what page number should be assigned to the first page in the document.
         This information will be reflected in elements' metadata and can be be especially
@@ -66,7 +51,7 @@ def partition_doc(
     """
     exactly_one(filename=filename, file=file)
 
-    last_modified = get_last_modified(filename, file, date_from_file_object)
+    last_modified = get_last_modified_date(filename) if filename else None
 
     # -- validate file-path when provided so we can provide a more meaningful error --
     if filename is not None and not os.path.exists(filename):
@@ -105,14 +90,10 @@ def partition_doc(
         # -- resulting elements are not double-chunked.
         elements = partition_docx(
             filename=target_file_path,
-            detect_language_per_element=detect_language_per_element,
-            include_metadata=include_metadata,
-            include_page_breaks=include_page_breaks,
-            languages=languages,
-            metadata_filename=metadata_filename,
+            metadata_filename=metadata_filename or filename,
+            metadata_file_type=FileType.DOC,
             metadata_last_modified=metadata_last_modified or last_modified,
-            starting_page_number=starting_page_number,
-            strategy=strategy,
+            **kwargs,
         )
 
     # -- Remove temporary document.docx path from metadata when necessary. Note `metadata_filename`
@@ -122,16 +103,3 @@ def partition_doc(
             element.metadata.filename = metadata_filename
 
     return elements
-
-
-def get_last_modified(
-    filename: str | None, file: IO[bytes] | None, date_from_file_object: bool
-) -> str | None:
-    """Determine best available last-modified date from partitioner document-source."""
-    if filename is not None:
-        return get_last_modified_date(filename)
-
-    if file is not None:
-        return get_last_modified_date_from_file(file) if date_from_file_object else None
-
-    return None

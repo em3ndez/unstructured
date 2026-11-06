@@ -50,7 +50,7 @@ fi
 # Note: When any of the optional arguments are provided, connector will ingest only those components, and nothing else.
 #       When none of the optional arguments are provided, all issues in all projects will be ingested.
 
-RUN_SCRIPT=${RUN_SCRIPT:-./unstructured/ingest/main.py}
+RUN_SCRIPT=${RUN_SCRIPT:-unstructured-ingest}
 PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   jira \
   --download-dir "$DOWNLOAD_DIR" \
@@ -58,7 +58,6 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --num-processes "$max_processes" \
   --preserve-downloads \
   --reprocess \
-  --output-dir "$OUTPUT_DIR" \
   --verbose \
   --url https://unstructured-jira-connector-test.atlassian.net \
   --user-email "$JIRA_INGEST_USER_EMAIL" \
@@ -66,6 +65,8 @@ PYTHONPATH=${PYTHONPATH:-.} "$RUN_SCRIPT" \
   --projects "JCTP3" \
   --boards "1" \
   --issues "JCTP2-4,JCTP2-7,JCTP2-8,10012,JCTP2-11" \
-  --work-dir "$WORK_DIR"
+  --work-dir "$WORK_DIR" \
+  local \
+  --output-dir "$OUTPUT_DIR"
 
 "$SCRIPT_DIR"/check-diff-expected-output.sh $OUTPUT_FOLDER_NAME

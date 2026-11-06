@@ -9,6 +9,7 @@ import io
 import json
 import pathlib
 from functools import partial
+from unittest.mock import patch
 
 import pytest
 
@@ -26,13 +27,14 @@ from unstructured.documents.elements import (
     DataSourceMetadata,
     Element,
     ElementMetadata,
+    Image,
     Points,
-    RegexMetadata,
     Text,
     Title,
     assign_and_map_hash_ids,
 )
 from unstructured.partition.json import partition_json
+from unstructured.staging.base import elements_from_base64_gzipped_json
 
 
 @pytest.mark.parametrize("element", [Element(), Text(text=""), CheckBox()])
@@ -57,6 +59,32 @@ def test_Element_autoassigns_a_UUID_then_becomes_an_idempotent_and_deterministic
 def test_Text_is_JSON_serializable():
     # -- This shold run without an error --
     json.dumps(Text(text="hello there!", element_id=None).to_dict())
+
+
+def test_Image_text_none_str_returns_empty_string():
+    # https://github.com/Unstructured-IO/unstructured/issues/4084
+    # -- `Image` elements whose `text` was normalized to `None` should still
+    # -- render as a string when `__str__` is called.
+    image = Image(text=None)
+    assert image.text == ""
+    assert str(image) == ""
+
+
+@pytest.mark.parametrize("element_cls", [Text, Image])
+@pytest.mark.parametrize("text", [None, "", "hello", " \u2603 ", "None"])
+def test_Text_normalizes_only_none(element_cls, text):
+    element = element_cls(text=text)
+    expected = "" if text is None else text
+    assert element.text == expected
+    assert str(element) == expected
+    assert element.to_dict()["text"] == expected
+
+
+def test_Image_str_handles_later_none_assignment_without_mutation():
+    image = Image(text="hello")
+    image.text = None
+    assert str(image) == ""
+    assert image.text is None
 
 
 @pytest.mark.parametrize(
@@ -235,24 +263,6 @@ def test_element_to_dict():
     }
 
 
-def test_regex_metadata_round_trips_through_JSON():
-    """metadata.regex_metadata should appear at full depth in JSON."""
-    regex_metadata = {
-        "mail-stop": [RegexMetadata(text="MS-107", start=18, end=24)],
-        "version": [
-            RegexMetadata(text="current=v1.7.2", start=7, end=21),
-            RegexMetadata(text="supersedes=v1.7.2", start=22, end=40),
-        ],
-    }
-    metadata = ElementMetadata(regex_metadata=regex_metadata)
-
-    metadata_json = json.dumps(metadata.to_dict())
-    deserialized_metadata = ElementMetadata.from_dict(json.loads(metadata_json))
-    reserialized_metadata_json = json.dumps(deserialized_metadata.to_dict())
-
-    assert reserialized_metadata_json == metadata_json
-
-
 class DescribeElementMetadata:
     """Unit-test suite for `unstructured.documents.elements.ElementMetadata`."""
 
@@ -406,6 +416,23 @@ class DescribeElementMetadata:
             "page_number": 2,
         }
 
+    def and_it_round_trips_an_enrichment_origins_dict_of_lists_through_a_dict(self):
+        enrichment_origins = {
+            "text": [
+                {"type": "enrichment_foo", "provider": "provider_a", "model": "model_x"},
+                {"type": "enrichment_bar", "provider": "provider_a", "model": "model_x"},
+            ],
+            "embeddings": [
+                {"type": "enrichment_baz", "provider": "provider_b", "model": "model_y"},
+            ],
+        }
+        meta = ElementMetadata(enrichment_origins=enrichment_origins)
+
+        # -- it serializes verbatim (no special-casing needed) --
+        assert meta.to_dict()["enrichment_origins"] == enrichment_origins
+        # -- and rehydrates to an equal value --
+        assert ElementMetadata.from_dict(meta.to_dict()).enrichment_origins == enrichment_origins
+
     def and_it_serializes_an_orig_elements_sub_object_to_base64_when_it_is_present(self):
         elements = assign_hash_ids([Title("Lorem"), Text("Lorem Ipsum")])
         meta = ElementMetadata(
@@ -414,16 +441,111 @@ class DescribeElementMetadata:
             page_number=2,
         )
 
-        assert meta.to_dict() == {
-            "category_depth": 1,
-            "orig_elements": (
-                "eJyFzcsKwjAQheFXKVm7MGkzbXwDocu6EpFcTqTQG3UEtfTdbZa"
-                "6cTnDd/jPi0CHHgNf2yAOmXCljjqXoErKoIw3hqJRXlPuyphrEr"
-                "tM9GAbLNvNL+t2M56ctvU4o0+AXxPSo2m5g9jIb6VwBE0VBSujp"
-                "1LJ6EiRLpwiSBf3fyvZcbo/vlqnwVvGbZzbN0KT7Hr5AG/eQyM="
+        meta_dict = meta.to_dict()
+
+        assert meta_dict["category_depth"] == 1
+        assert meta_dict["page_number"] == 2
+        # Verify the orig_elements value is a base64 string that round-trips correctly.
+        # We don't compare the exact compressed bytes because zlib output varies across
+        # implementations (e.g. standard zlib vs zlib-ng).
+        assert isinstance(meta_dict["orig_elements"], str)
+        restored = elements_from_base64_gzipped_json(meta_dict["orig_elements"])
+        assert len(restored) == 2
+        assert restored[0].text == "Lorem"
+        assert restored[1].text == "Lorem Ipsum"
+
+    def and_it_does_not_deep_copy_the_sub_objects_it_reserializes(self):
+        """`to_dict()` replaces `orig_elements` with its base64 form, so copying it first is waste.
+
+        On a chunk, `orig_elements` holds every source element of that chunk, so the discarded copy
+        dominated the cost of serializing it.
+        """
+        meta = ElementMetadata(
+            orig_elements=assign_hash_ids([Title("Lorem"), Text("Lorem Ipsum")]),
+            page_number=2,
+        )
+        copied_dicts = []
+        real_deepcopy = copy.deepcopy
+
+        def recording_deepcopy(x, memo=None):
+            if isinstance(x, dict):
+                copied_dicts.append(x)
+            return real_deepcopy(x, memo)
+
+        with patch.object(copy, "deepcopy", recording_deepcopy):
+            meta.to_dict()
+
+        assert copied_dicts, "expected `to_dict()` to copy its remaining fields"
+        assert all(
+            separately_serialized_field not in copied
+            for copied in copied_dicts
+            for separately_serialized_field in ElementMetadata.SEPARATELY_SERIALIZED_FIELD_NAMES
+        )
+
+    def and_it_emits_the_separately_serialized_fields_in_their_declared_position(self):
+        """A field's key position must not depend on whether it gets a separate serialized form.
+
+        `Element.to_dict()` output is written verbatim by consumers that do not sort keys, so
+        moving `coordinates`, `data_source`, `orig_elements` or `key_value_pairs` to the end of the
+        dict changes the bytes they write.
+        """
+        meta = ElementMetadata(
+            coordinates=CoordinatesMetadata(
+                points=((2, 2), (1, 4), (3, 4), (3, 2)), system=RelativeCoordinateSystem()
             ),
-            "page_number": 2,
-        }
+            data_source=DataSourceMetadata(url="https://example.com"),
+            filetype="text/plain",
+            languages=["eng"],
+            orig_elements=assign_hash_ids([Title("Lorem"), Text("Lorem Ipsum")]),
+            page_number=2,
+        )
+
+        assert list(meta.to_dict()) == [
+            "coordinates",
+            "data_source",
+            "filetype",
+            "languages",
+            "orig_elements",
+            "page_number",
+        ]
+
+    def and_it_serializes_orig_elements_the_same_way_on_every_call(self):
+        """Two `to_dict()` calls on one metadata must agree on the ids of its `orig_elements`.
+
+        `Element.id` mints a uuid on first access and caches it on that instance. Copying the
+        elements meant each call materialized ids on throwaway copies, so consecutive
+        serializations of one chunk reported different ids for the same source elements.
+        """
+        meta = ElementMetadata(orig_elements=[Title("Lorem"), Text("Lorem Ipsum")])
+
+        assert meta.to_dict()["orig_elements"] == meta.to_dict()["orig_elements"]
+
+    @pytest.mark.parametrize(
+        "orig_element",
+        [
+            Text(
+                "Lorem",
+                metadata=ElementMetadata(
+                    coordinates=CoordinatesMetadata(
+                        points=((1.234, 2.345), (1.234, 4.567), (3.456, 4.567), (3.456, 2.345)),
+                        system=RelativeCoordinateSystem(),
+                    )
+                ),
+            ),
+            Text("Lorem", metadata=ElementMetadata(detection_class_prob=0.123456)),
+        ],
+        ids=["coordinates", "detection_class_prob"],
+    )
+    def and_that_holds_for_elements_whose_precision_still_has_to_be_rounded(self, orig_element):
+        """Rounding an element's precision requires a copy, and the copy must not take the id.
+
+        `Element.id` caches on first access, so an element that still goes through the copy would
+        otherwise mint a new uuid on the throwaway each time. Every hi_res-partitioned element
+        carries coordinates, so this is the common case rather than the corner one.
+        """
+        meta = ElementMetadata(orig_elements=[orig_element])
+
+        assert meta.to_dict()["orig_elements"] == meta.to_dict()["orig_elements"]
 
     def but_unlike_in_ElementMetadata_unknown_fields_in_sub_objects_are_ignored(self):
         """Metadata sub-objects ignore fields they do not explicitly define.
@@ -678,10 +800,28 @@ class DescribeElementMetadata:
             )
 
 
+def test_hash_ids_are_unique_when_a_page_is_not_contiguous_in_the_element_list():
+    # GIVEN -- a list whose page numbers are not sorted, as happens when elements of two
+    # partitions of the same document are combined
+    elements: list[Element] = [
+        Text(text="Section", metadata=ElementMetadata(page_number=1)),
+        Text(text="Interlude", metadata=ElementMetadata(page_number=2)),
+        Text(text="Section", metadata=ElementMetadata(page_number=1)),
+    ]
+
+    # WHEN
+    updated_elements = assign_and_map_hash_ids(copy.deepcopy(elements))
+
+    # THEN -- the third element is the second element of page 1 and must not collide with the
+    # first element of page 1, which also says "Section"
+    ids = [element.id for element in updated_elements]
+    assert len(ids) == len(set(ids)), "Recalculated IDs must be unique."
+
+
 def test_hash_ids_are_unique_for_duplicate_elements():
     # GIVEN
     parent = Text(text="Parent", metadata=ElementMetadata(page_number=1))
-    elements = [
+    elements: list[Element] = [
         parent,
         Text(text="Element", metadata=ElementMetadata(page_number=1, parent_id=parent.id)),
         Text(text="Element", metadata=ElementMetadata(page_number=1, parent_id=parent.id)),
@@ -699,14 +839,29 @@ def test_hash_ids_are_unique_for_duplicate_elements():
         assert updated_element.id != elements[idx].id, "IDs haven't changed after recalculation"
         if updated_element.metadata.parent_id is not None:
             assert updated_element.metadata.parent_id in ids, "Parent ID not in the list of IDs"
-            assert (
-                updated_element.metadata.parent_id != elements[idx].metadata.parent_id
-            ), "Parent ID hasn't changed after recalculation"
+            assert updated_element.metadata.parent_id != elements[idx].metadata.parent_id, (
+                "Parent ID hasn't changed after recalculation"
+            )
+
+
+def test_hash_ids_can_handle_duplicated_element_instances():
+    # GIVEN
+    parent = Text(text="Parent", metadata=ElementMetadata(page_number=1))
+    element = Text(text="Element", metadata=ElementMetadata(page_number=1, parent_id=parent.id))
+    elements: list[Element] = [parent, element, element]
+
+    # WHEN
+    updated_elements = assign_and_map_hash_ids(copy.deepcopy(elements))
+    ids = [element.id for element in updated_elements]
+
+    # THEN
+    assert len(ids) == len(set(ids)) + 1, "One element is duplicated so uniques should be one less."
+    assert elements[1].metadata.parent_id == elements[2].metadata.parent_id
 
 
 def test_hash_ids_are_deterministic():
     parent = Text(text="Parent", metadata=ElementMetadata(page_number=1))
-    elements = [
+    elements: list[Element] = [
         parent,
         Text(text="Element", metadata=ElementMetadata(page_number=1, parent_id=parent.id)),
         Text(text="Element", metadata=ElementMetadata(page_number=1, parent_id=parent.id)),
@@ -739,7 +894,9 @@ def test_hash_ids_are_deterministic():
         ("some text", 1, "some.txt", None, "e3fd10d867c4a1c0264dde40e3d7e45a"),
     ],
 )
-def test_id_to_hash_calculates(text, sequence_number, filename, page_number, expected_hash):
+def test_id_to_hash_calculates(
+    text: str, sequence_number: int, filename: str, page_number: int | None, expected_hash: str
+):
     element = Text(
         text=text,
         metadata=ElementMetadata(filename=filename, page_number=page_number),
@@ -754,5 +911,5 @@ def test_formskeysvalues_reads_saves():
     tmp_file = io.StringIO()
     json.dump([element.to_dict() for element in as_read], tmp_file)
     tmp_file.seek(0)
-    as_read_2 = partition_json(file=tmp_file)
+    as_read_2 = partition_json(file=tmp_file)  # type: ignore[arg-type]
     assert as_read == as_read_2
